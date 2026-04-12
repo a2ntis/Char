@@ -40,7 +40,26 @@ struct CompanionSettingsView: View {
                 }
                 .pickerStyle(.menu)
 
-                Toggle("Озвучивать ответы", isOn: $viewModel.voiceRepliesEnabled)
+                Toggle(
+                    "Озвучивать ответы",
+                    isOn: Binding(
+                        get: { viewModel.voiceRepliesEnabled },
+                        set: { viewModel.setVoiceRepliesEnabled($0) }
+                    )
+                )
+
+                Picker(
+                    "Язык ответа",
+                    selection: Binding(
+                        get: { viewModel.profile.responseLanguage },
+                        set: { viewModel.setResponseLanguage($0) }
+                    )
+                ) {
+                    ForEach(CompanionResponseLanguage.allCases) { language in
+                        Text(language.displayName).tag(language)
+                    }
+                }
+                .pickerStyle(.menu)
 
                 LabeledContent("Горячая клавиша") {
                     Text("⌃⌥H")
@@ -52,17 +71,178 @@ struct CompanionSettingsView: View {
                     .foregroundStyle(.secondary)
             }
 
-            Section("Локальная модель") {
-                LabeledContent("LLM") {
-                    Text(viewModel.profile.model)
-                        .foregroundStyle(.secondary)
+            Section("LLM") {
+                Picker(
+                    "Провайдер",
+                    selection: Binding(
+                        get: { viewModel.profile.provider },
+                        set: { viewModel.setProvider($0) }
+                    )
+                ) {
+                    ForEach(CompanionLLMProvider.allCases) { provider in
+                        Text(provider.displayName).tag(provider)
+                    }
+                }
+                .pickerStyle(.menu)
+
+                if viewModel.profile.provider == .ollama {
+                    if !viewModel.availableLLMModels.isEmpty {
+                        Picker(
+                            "Локальная модель",
+                            selection: Binding(
+                                get: { viewModel.profile.ollamaModel },
+                                set: { viewModel.setActiveLLMModel($0) }
+                            )
+                        ) {
+                            ForEach(viewModel.availableLLMModels, id: \.self) { model in
+                                Text(model).tag(model)
+                            }
+                        }
+                        .pickerStyle(.menu)
+                    } else {
+                        TextField(
+                            "Модель Ollama",
+                            text: Binding(
+                                get: { viewModel.profile.ollamaModel },
+                                set: { viewModel.setActiveLLMModel($0) }
+                            )
+                        )
+                        .textFieldStyle(.roundedBorder)
+                    }
+
+                    TextField(
+                        "Endpoint Ollama",
+                        text: Binding(
+                            get: { viewModel.ollamaEndpointText },
+                            set: { viewModel.setActiveEndpoint($0) }
+                        )
+                    )
+                    .textFieldStyle(.roundedBorder)
+
+                    HStack {
+                        Button(viewModel.isRefreshingLLMModels ? "Обновляю..." : "Обновить список моделей") {
+                            Task { await viewModel.refreshLLMModels() }
+                        }
+                        .disabled(viewModel.isRefreshingLLMModels)
+
+                        Button("Проверить подключение") {
+                            Task { await viewModel.validateLLMConnection() }
+                        }
+                        .disabled(viewModel.isRefreshingLLMModels)
+
+                        if !viewModel.availableLLMModels.isEmpty {
+                            Text("\(viewModel.availableLLMModels.count) найдено")
+                                .foregroundStyle(.secondary)
+                        }
+                    }
+                } else if viewModel.profile.provider == .openAI {
+                    if !viewModel.availableOpenAIModels.isEmpty {
+                        Picker(
+                            "Модель OpenAI",
+                            selection: Binding(
+                                get: { viewModel.profile.openAIModel },
+                                set: { viewModel.setActiveLLMModel($0) }
+                            )
+                        ) {
+                            ForEach(viewModel.availableOpenAIModels, id: \.self) { model in
+                                Text(model).tag(model)
+                            }
+                        }
+                        .pickerStyle(.menu)
+                    } else {
+                        Text("Список моделей появится после успешного запроса к OpenAI.")
+                            .font(.footnote)
+                            .foregroundStyle(.secondary)
+                    }
+
+                    TextField(
+                        "Endpoint OpenAI",
+                        text: Binding(
+                            get: { viewModel.openAIEndpointText },
+                            set: { viewModel.setActiveEndpoint($0) }
+                        )
+                    )
+                    .textFieldStyle(.roundedBorder)
+
+                    SecureField(
+                        "OpenAI API Key",
+                        text: Binding(
+                            get: { viewModel.openAIAPIKey },
+                            set: { viewModel.setOpenAIAPIKey($0) }
+                        )
+                    )
+                    .textFieldStyle(.roundedBorder)
+
+                    HStack {
+                        Button(viewModel.isRefreshingLLMModels ? "Обновляю..." : "Обновить список OpenAI моделей") {
+                            Task { await viewModel.refreshLLMModels() }
+                        }
+                        .disabled(viewModel.isRefreshingLLMModels)
+
+                        Button("Проверить подключение") {
+                            Task { await viewModel.validateLLMConnection() }
+                        }
+                        .disabled(viewModel.isRefreshingLLMModels)
+
+                        Text("Показываются только модели, которые реально доступны этому ключу.")
+                            .font(.footnote)
+                            .foregroundStyle(.secondary)
+                    }
+                } else {
+                    if !viewModel.availableLMStudioModels.isEmpty {
+                        Picker(
+                            "Модель LM Studio",
+                            selection: Binding(
+                                get: { viewModel.profile.lmStudioModel },
+                                set: { viewModel.setActiveLLMModel($0) }
+                            )
+                        ) {
+                            ForEach(viewModel.availableLMStudioModels, id: \.self) { model in
+                                Text(model).tag(model)
+                            }
+                        }
+                        .pickerStyle(.menu)
+                    } else {
+                        TextField(
+                            "Модель LM Studio",
+                            text: Binding(
+                                get: { viewModel.profile.lmStudioModel },
+                                set: { viewModel.setActiveLLMModel($0) }
+                            )
+                        )
+                        .textFieldStyle(.roundedBorder)
+                    }
+
+                    TextField(
+                        "Endpoint LM Studio",
+                        text: Binding(
+                            get: { viewModel.lmStudioEndpointText },
+                            set: { viewModel.setActiveEndpoint($0) }
+                        )
+                    )
+                    .textFieldStyle(.roundedBorder)
+
+                    HStack {
+                        Button(viewModel.isRefreshingLLMModels ? "Обновляю..." : "Обновить список LM Studio моделей") {
+                            Task { await viewModel.refreshLLMModels() }
+                        }
+                        .disabled(viewModel.isRefreshingLLMModels)
+
+                        Button("Проверить подключение") {
+                            Task { await viewModel.validateLLMConnection() }
+                        }
+                        .disabled(viewModel.isRefreshingLLMModels)
+
+                        Text("Ожидается локальный OpenAI-compatible сервер LM Studio.")
+                            .font(.footnote)
+                            .foregroundStyle(.secondary)
+                    }
                 }
 
-                LabeledContent("Endpoint") {
-                    Text(viewModel.profile.endpoint.absoluteString)
+                if !viewModel.status.isEmpty {
+                    Text(viewModel.status)
+                        .font(.footnote)
                         .foregroundStyle(.secondary)
-                        .lineLimit(1)
-                        .truncationMode(.middle)
                 }
             }
 

@@ -24,3 +24,4 @@ Local desktop anime companion for macOS.
 - Default endpoint: `http://127.0.0.1:11434/api/chat`
 - Default model: `qwen3:14b`
 - Speech input is scaffolded, but for a polished always-on microphone flow it is better to open the package in Xcode and add the usual macOS privacy strings and signing setup.
+- For the current self-use MVP, the OpenAI API key is stored in local app settings to avoid repeated macOS password prompts. For a proper distributable app, switch this back to Keychain storage after adding stable app signing/notarization.

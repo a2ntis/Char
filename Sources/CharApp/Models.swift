@@ -1,6 +1,55 @@
 import Foundation
 import CoreGraphics
 
+enum CompanionLLMProvider: String, CaseIterable, Codable, Hashable, Identifiable {
+    case ollama
+    case openAI
+    case lmStudio
+
+    var id: String { rawValue }
+
+    var displayName: String {
+        switch self {
+        case .ollama:
+            return "Ollama"
+        case .openAI:
+            return "OpenAI"
+        case .lmStudio:
+            return "LM Studio"
+        }
+    }
+}
+
+enum CompanionResponseLanguage: String, CaseIterable, Codable, Hashable, Identifiable {
+    case russian
+    case ukrainian
+    case english
+
+    var id: String { rawValue }
+
+    var displayName: String {
+        switch self {
+        case .russian:
+            return "Русский"
+        case .ukrainian:
+            return "Українська"
+        case .english:
+            return "English"
+        }
+    }
+
+    var systemInstruction: String {
+        switch self {
+        case .russian:
+            return "Always reply in Russian unless the user explicitly asks you to switch languages."
+        case .ukrainian:
+            return "Always reply in Ukrainian unless the user explicitly asks you to switch languages."
+        case .english:
+            return "Always reply in English unless the user explicitly asks you to switch languages."
+        }
+    }
+}
+
 struct ChatMessage: Identifiable, Hashable {
     let id = UUID()
     let role: Role
@@ -14,7 +63,7 @@ struct ChatMessage: Identifiable, Hashable {
     }
 }
 
-struct CompanionProfile {
+struct CompanionProfile: Codable, Hashable {
     var name: String = "Hana"
     var persona: String = """
     You are Hana, a warm anime-style desktop companion living on the user's Mac.
@@ -22,8 +71,62 @@ struct CompanionProfile {
     You are not a generic assistant; you are a charming companion who can chat naturally,
     react to the user's mood, and keep the conversation light unless the user asks for detail.
     """
-    var model: String = "qwen3:14b"
-    var endpoint: URL = URL(string: "http://127.0.0.1:11434/api/chat")!
+    var responseLanguage: CompanionResponseLanguage = .russian
+    var provider: CompanionLLMProvider = .ollama
+    var ollamaModel: String = "qwen3:14b"
+    var ollamaEndpoint: URL = URL(string: "http://127.0.0.1:11434/api/chat")!
+    var openAIModel: String = ""
+    var openAIEndpoint: URL = URL(string: "https://api.openai.com/v1/chat/completions")!
+    var lmStudioModel: String = ""
+    var lmStudioEndpoint: URL = URL(string: "http://127.0.0.1:1234/v1/chat/completions")!
+
+    var activeModel: String {
+        switch provider {
+        case .ollama:
+            return ollamaModel
+        case .openAI:
+            return openAIModel
+        case .lmStudio:
+            return lmStudioModel
+        }
+    }
+
+    var activeEndpoint: URL {
+        switch provider {
+        case .ollama:
+            return ollamaEndpoint
+        case .openAI:
+            return openAIEndpoint
+        case .lmStudio:
+            return lmStudioEndpoint
+        }
+    }
+
+    mutating func setActiveModel(_ model: String) {
+        switch provider {
+        case .ollama:
+            ollamaModel = model
+        case .openAI:
+            openAIModel = model
+        case .lmStudio:
+            lmStudioModel = model
+        }
+    }
+
+    mutating func setActiveEndpoint(_ endpoint: URL) {
+        switch provider {
+        case .ollama:
+            ollamaEndpoint = endpoint
+        case .openAI:
+            openAIEndpoint = endpoint
+        case .lmStudio:
+            lmStudioEndpoint = endpoint
+        }
+    }
+
+    var systemPrompt: String {
+        persona + "\n\n" + responseLanguage.systemInstruction
+    }
 }
 
 struct CompanionModelOption: Identifiable, Hashable {

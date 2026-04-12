@@ -7,20 +7,31 @@ final class CompanionViewModel: ObservableObject {
     private enum DefaultsKey {
         static let selectedModelID = "selectedCompanionModelID"
         static let avatarZoom = "companionAvatarZoom"
+        static let profile = "companionProfile"
+        static let voiceRepliesEnabled = "voiceRepliesEnabled"
+        static let openAIAPIKey = "openAIAPIKey"
     }
 
     @Published var messages: [ChatMessage]
     @Published var draft: String = ""
     @Published var isSending = false
     @Published var status = ""
-    @Published var voiceRepliesEnabled = true
+    @Published var voiceRepliesEnabled: Bool
     @Published var panelExpanded = true
     @Published var isBubbleVisible = false
-    @Published var profile = CompanionProfile()
+    @Published var profile: CompanionProfile
     @Published var availableModels: [CompanionModelOption]
     @Published var selectedModelID: String
     @Published var avatarAspectRatio: CGFloat
     @Published var avatarZoom: CGFloat
+    @Published var ollamaEndpointText: String
+    @Published var openAIEndpointText: String
+    @Published var lmStudioEndpointText: String
+    @Published var availableLLMModels: [String] = []
+    @Published var availableOpenAIModels: [String] = []
+    @Published var availableLMStudioModels: [String] = []
+    @Published var isRefreshingLLMModels = false
+    @Published var openAIAPIKey: String
     @Published var presenceState: CompanionPresenceState = .idle
     @Published var emotionState: CompanionEmotionState = .neutral
     @Published var isAvatarDragging = false
@@ -31,12 +42,17 @@ final class CompanionViewModel: ObservableObject {
 
     let speech = SpeechCoordinator()
 
-    private let client = OllamaClient()
+    private let client = CompanionChatClient()
     private var cancellables: Set<AnyCancellable> = []
     private var emotionResetTask: Task<Void, Never>?
     private var dragResetTask: Task<Void, Never>?
 
     init() {
+        let loadedProfile = Self.loadProfile()
+        profile = loadedProfile
+        voiceRepliesEnabled = UserDefaults.standard.object(forKey: DefaultsKey.voiceRepliesEnabled) as? Bool ?? true
+        openAIAPIKey = UserDefaults.standard.string(forKey: DefaultsKey.openAIAPIKey) ?? ""
+
         let assetsRoot = AppEnvironment.assetsRootURL
         let discoveredModels = ModelCatalog.discoverModels(in: assetsRoot)
         let fallbackModel = CompanionModelOption(
@@ -55,14 +71,13 @@ final class CompanionViewModel: ObservableObject {
         avatarAspectRatio = 0.86
         let savedZoom = CGFloat(UserDefaults.standard.double(forKey: DefaultsKey.avatarZoom))
         avatarZoom = savedZoom > 0 ? min(max(savedZoom, 0.6), 2.4) : 1.0
+        ollamaEndpointText = loadedProfile.ollamaEndpoint.absoluteString
+        openAIEndpointText = loadedProfile.openAIEndpoint.absoluteString
+        lmStudioEndpointText = loadedProfile.lmStudioEndpoint.absoluteString
         messages = [
             ChatMessage(
                 role: .system,
-                text: CompanionProfile().persona
-            ),
-            ChatMessage(
-                role: .assistant,
-                text: "Привет. Я рядом."
+                text: loadedProfile.systemPrompt
             )
         ]
 
@@ -71,6 +86,10 @@ final class CompanionViewModel: ObservableObject {
 
     func boot() {
         status = ""
+        Task {
+            await refreshLLMModelsIfNeeded()
+            await generateStartupGreetingIfNeeded()
+        }
     }
 
     var selectedModel: CompanionModelOption {
@@ -123,6 +142,140 @@ final class CompanionViewModel: ObservableObject {
         UserDefaults.standard.set(id, forKey: DefaultsKey.selectedModelID)
     }
 
+    func setProvider(_ provider: CompanionLLMProvider) {
+        guard profile.provider != provider else { return }
+        profile.provider = provider
+        status = ""
+        persistProfile()
+        Task { await refreshLLMModelsIfNeeded() }
+    }
+
+    func setResponseLanguage(_ language: CompanionResponseLanguage) {
+        guard profile.responseLanguage != language else { return }
+        profile.responseLanguage = language
+        rewriteSystemPrompt()
+        status = ""
+        persistProfile()
+    }
+
+    func setActiveLLMModel(_ model: String) {
+        profile.setActiveModel(model)
+        persistProfile()
+    }
+
+    func setActiveEndpoint(_ endpointString: String) {
+        let trimmed = endpointString.trimmingCharacters(in: .whitespacesAndNewlines)
+        switch profile.provider {
+        case .ollama:
+            ollamaEndpointText = endpointString
+        case .openAI:
+            openAIEndpointText = endpointString
+        case .lmStudio:
+            lmStudioEndpointText = endpointString
+        }
+
+        guard let url = URL(string: trimmed), !trimmed.isEmpty else { return }
+        profile.setActiveEndpoint(url)
+        status = ""
+        persistProfile()
+        Task { await refreshLLMModelsIfNeeded() }
+    }
+
+    func setVoiceRepliesEnabled(_ enabled: Bool) {
+        voiceRepliesEnabled = enabled
+        UserDefaults.standard.set(enabled, forKey: DefaultsKey.voiceRepliesEnabled)
+    }
+
+    func setOpenAIAPIKey(_ key: String) {
+        openAIAPIKey = key
+        UserDefaults.standard.set(key, forKey: DefaultsKey.openAIAPIKey)
+        if profile.provider == .openAI, !key.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+            Task { await refreshLLMModelsIfNeeded() }
+        }
+    }
+
+    func refreshLLMModels() async {
+        isRefreshingLLMModels = true
+        switch profile.provider {
+        case .ollama:
+            do {
+                let models = try await client.listOllamaModels(endpoint: profile.ollamaEndpoint)
+                availableLLMModels = models
+                if profile.ollamaModel.isEmpty, let first = models.first {
+                    profile.ollamaModel = first
+                    persistProfile()
+                }
+            } catch {
+                availableLLMModels = []
+                status = error.localizedDescription
+            }
+        case .openAI:
+            do {
+                let fetched = try await client.listOpenAIModels(endpoint: profile.openAIEndpoint, apiKey: openAIAPIKey)
+                availableOpenAIModels = Array(Set(fetched)).sorted()
+                if availableOpenAIModels.isEmpty {
+                    let previousModel = profile.openAIModel
+                    profile.openAIModel = ""
+                    persistProfile()
+                    if !previousModel.isEmpty {
+                        status = "OpenAI не вернул доступных чат-моделей для этого ключа."
+                    }
+                } else if profile.openAIModel.isEmpty, let first = availableOpenAIModels.first {
+                    profile.openAIModel = first
+                    persistProfile()
+                } else if !availableOpenAIModels.contains(profile.openAIModel), let first = availableOpenAIModels.first {
+                    let previousModel = profile.openAIModel
+                    profile.openAIModel = first
+                    persistProfile()
+                    if !previousModel.isEmpty {
+                        status = "Модель OpenAI \"\(previousModel)\" недоступна для этого ключа. Переключила на \"\(first)\"."
+                    }
+                }
+            } catch {
+                availableOpenAIModels = []
+                status = error.localizedDescription
+            }
+        case .lmStudio:
+            do {
+                let models = try await client.listLMStudioModels(endpoint: profile.lmStudioEndpoint)
+                availableLMStudioModels = models
+                if profile.lmStudioModel.isEmpty, let first = models.first {
+                    profile.lmStudioModel = first
+                    persistProfile()
+                }
+            } catch {
+                availableLMStudioModels = []
+                status = error.localizedDescription
+            }
+        }
+        isRefreshingLLMModels = false
+    }
+
+    func validateLLMConnection() async {
+        isRefreshingLLMModels = true
+        status = ""
+        do {
+            status = try await client.validate(profile: profile, openAIKey: openAIAPIKey)
+        } catch {
+            status = error.localizedDescription
+        }
+        isRefreshingLLMModels = false
+    }
+
+    func generateStartupGreetingIfNeeded() async {
+        guard visibleMessages.isEmpty else { return }
+        guard !profile.activeModel.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else { return }
+        guard !isSending else { return }
+
+        do {
+            let greeting = try await client.generateGreeting(profile: profile, openAIKey: openAIAPIKey)
+            guard !greeting.isEmpty, visibleMessages.isEmpty else { return }
+            messages.append(ChatMessage(role: .assistant, text: greeting))
+        } catch {
+            // Intentionally silent: no fallback greeting if the model is unavailable.
+        }
+    }
+
     func sendCurrentDraft() async {
         let trimmed = draft.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !trimmed.isEmpty, !isSending else { return }
@@ -133,12 +286,13 @@ final class CompanionViewModel: ObservableObject {
     func send(text: String) async {
         guard !text.isEmpty, !isSending else { return }
         isSending = true
+        status = ""
         updatePresence()
 
         messages.append(ChatMessage(role: .user, text: text))
 
         do {
-            let reply = try await client.send(messages: messages, profile: profile)
+            let reply = try await client.send(messages: conversationMessages, profile: profile, openAIKey: openAIAPIKey)
             messages.append(ChatMessage(role: .assistant, text: reply))
             setEmotion(for: reply)
             if voiceRepliesEnabled {
@@ -153,6 +307,7 @@ final class CompanionViewModel: ObservableObject {
                 }
             }
         } catch {
+            status = error.localizedDescription
             messages.append(ChatMessage(role: .assistant, text: "Я сейчас немного задумалась и не смогла ответить. Попробуй еще раз через секунду."))
         }
 
@@ -231,6 +386,58 @@ final class CompanionViewModel: ObservableObject {
                 self?.updatePresence()
             }
             .store(in: &cancellables)
+
+        $profile
+            .dropFirst()
+            .sink { [weak self] _ in
+                self?.persistProfile()
+            }
+            .store(in: &cancellables)
+    }
+
+    private func refreshLLMModelsIfNeeded() async {
+        if profile.provider == .ollama {
+            await refreshLLMModels()
+        } else if !openAIAPIKey.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+            await refreshLLMModels()
+        } else if profile.provider == .lmStudio {
+            await refreshLLMModels()
+        } else {
+            availableOpenAIModels = []
+            isRefreshingLLMModels = false
+        }
+    }
+
+    private func persistProfile() {
+        guard let data = try? JSONEncoder().encode(profile) else { return }
+        UserDefaults.standard.set(data, forKey: DefaultsKey.profile)
+    }
+
+    private var conversationMessages: [ChatMessage] {
+        var copy = messages
+        if let systemIndex = copy.firstIndex(where: { $0.role == .system }) {
+            copy[systemIndex] = ChatMessage(role: .system, text: profile.systemPrompt)
+        } else {
+            copy.insert(ChatMessage(role: .system, text: profile.systemPrompt), at: 0)
+        }
+        return copy
+    }
+
+    private func rewriteSystemPrompt() {
+        if let systemIndex = messages.firstIndex(where: { $0.role == .system }) {
+            messages[systemIndex] = ChatMessage(role: .system, text: profile.systemPrompt)
+        } else {
+            messages.insert(ChatMessage(role: .system, text: profile.systemPrompt), at: 0)
+        }
+    }
+
+    private static func loadProfile() -> CompanionProfile {
+        guard let data = UserDefaults.standard.data(forKey: DefaultsKey.profile),
+              let profile = try? JSONDecoder().decode(CompanionProfile.self, from: data) else {
+            return CompanionProfile()
+        }
+
+        return profile
     }
 
     private func updatePresence() {
