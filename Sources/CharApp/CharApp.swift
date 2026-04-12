@@ -40,14 +40,6 @@ struct CompanionSettingsView: View {
                 }
                 .pickerStyle(.menu)
 
-                Toggle(
-                    "Озвучивать ответы",
-                    isOn: Binding(
-                        get: { viewModel.voiceRepliesEnabled },
-                        set: { viewModel.setVoiceRepliesEnabled($0) }
-                    )
-                )
-
                 Picker(
                     "Язык ответа",
                     selection: Binding(
@@ -69,6 +61,99 @@ struct CompanionSettingsView: View {
                 Text("Размер аватара подстраивается под пропорции выбранной Live2D-модели.")
                     .font(.footnote)
                     .foregroundStyle(.secondary)
+            }
+
+            Section("Голос") {
+                Toggle(
+                    "Озвучивать ответы",
+                    isOn: Binding(
+                        get: { viewModel.voiceRepliesEnabled },
+                        set: { viewModel.setVoiceRepliesEnabled($0) }
+                    )
+                )
+
+                Picker(
+                    "Провайдер озвучки",
+                    selection: Binding(
+                        get: { viewModel.profile.ttsProvider },
+                        set: { viewModel.setTTSProvider($0) }
+                    )
+                ) {
+                    ForEach(CompanionTTSProvider.allCases) { provider in
+                        Text(provider.displayName).tag(provider)
+                    }
+                }
+                .pickerStyle(.menu)
+
+                if viewModel.profile.ttsProvider == .system {
+                    Text("Используется встроенный голос macOS. Язык берется из настройки ответа.")
+                        .font(.footnote)
+                        .foregroundStyle(.secondary)
+                } else {
+                    TextField(
+                        "Путь к Piper",
+                        text: Binding(
+                            get: { viewModel.piperExecutablePathText },
+                            set: { viewModel.setPiperExecutablePath($0) }
+                        )
+                    )
+                    .textFieldStyle(.roundedBorder)
+
+                    HStack {
+                        Text(viewModel.piperVoicesDirectoryText.isEmpty ? "Папка с голосами не выбрана" : viewModel.piperVoicesDirectoryText)
+                            .lineLimit(2)
+                            .font(.footnote)
+                            .foregroundStyle(.secondary)
+
+                        Spacer(minLength: 12)
+
+                        Button("Выбрать папку") {
+                            viewModel.choosePiperVoicesDirectory()
+                        }
+                    }
+
+                    if !viewModel.availablePiperVoices.isEmpty {
+                        Picker(
+                            "Найденные голоса",
+                            selection: Binding(
+                                get: { viewModel.profile.piperModelPath },
+                                set: { viewModel.selectPiperVoice($0) }
+                            )
+                        ) {
+                            ForEach(viewModel.availablePiperVoices) { voice in
+                                Text(voice.displayName).tag(voice.modelPath)
+                            }
+                        }
+                        .pickerStyle(.menu)
+                    }
+
+                    Text("Piper ожидает локальный бинарник и голосовую модель `.onnx`.")
+                        .font(.footnote)
+                        .foregroundStyle(.secondary)
+
+                    Text(viewModel.piperStatusSummary)
+                        .font(.footnote)
+                        .foregroundStyle(.secondary)
+
+                    VStack(alignment: .leading, spacing: 8) {
+                        Button("Подставить локальный Piper") {
+                            viewModel.autofillPiperPaths()
+                        }
+
+                        Button("Обновить список голосов") {
+                            viewModel.refreshPiperVoices()
+                        }
+
+                        Button(viewModel.isInstallingPiper ? "Устанавливаю..." : "Установить Piper автоматически") {
+                            Task { await viewModel.installPiperAutomatically() }
+                        }
+                        .disabled(viewModel.isInstallingPiper)
+                    }
+                }
+
+                Button("Пробный голос") {
+                    viewModel.previewVoice()
+                }
             }
 
             Section("LLM") {

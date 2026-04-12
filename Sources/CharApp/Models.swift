@@ -20,6 +20,22 @@ enum CompanionLLMProvider: String, CaseIterable, Codable, Hashable, Identifiable
     }
 }
 
+enum CompanionTTSProvider: String, CaseIterable, Codable, Hashable, Identifiable {
+    case system
+    case piper
+
+    var id: String { rawValue }
+
+    var displayName: String {
+        switch self {
+        case .system:
+            return "Системный голос"
+        case .piper:
+            return "Piper (локально)"
+        }
+    }
+}
+
 enum CompanionResponseLanguage: String, CaseIterable, Codable, Hashable, Identifiable {
     case russian
     case ukrainian
@@ -72,6 +88,10 @@ struct CompanionProfile: Codable, Hashable {
     react to the user's mood, and keep the conversation light unless the user asks for detail.
     """
     var responseLanguage: CompanionResponseLanguage = .russian
+    var ttsProvider: CompanionTTSProvider = .system
+    var piperExecutablePath: String = "piper"
+    var piperVoicesDirectory: String = ""
+    var piperModelPath: String = ""
     var provider: CompanionLLMProvider = .ollama
     var ollamaModel: String = "qwen3:14b"
     var ollamaEndpoint: URL = URL(string: "http://127.0.0.1:11434/api/chat")!
@@ -127,6 +147,54 @@ struct CompanionProfile: Codable, Hashable {
     var systemPrompt: String {
         persona + "\n\n" + responseLanguage.systemInstruction
     }
+
+    enum CodingKeys: String, CodingKey {
+        case name
+        case persona
+        case responseLanguage
+        case ttsProvider
+        case piperExecutablePath
+        case piperVoicesDirectory
+        case piperModelPath
+        case provider
+        case ollamaModel
+        case ollamaEndpoint
+        case openAIModel
+        case openAIEndpoint
+        case lmStudioModel
+        case lmStudioEndpoint
+    }
+
+    init() {}
+
+    init(from decoder: Decoder) throws {
+        let container = try decoder.container(keyedBy: CodingKeys.self)
+        name = try container.decodeIfPresent(String.self, forKey: .name) ?? "Hana"
+        persona = try container.decodeIfPresent(String.self, forKey: .persona) ?? """
+        You are Hana, a warm anime-style desktop companion living on the user's Mac.
+        Keep answers concise, emotionally expressive, playful, and supportive.
+        You are not a generic assistant; you are a charming companion who can chat naturally,
+        react to the user's mood, and keep the conversation light unless the user asks for detail.
+        """
+        responseLanguage = try container.decodeIfPresent(CompanionResponseLanguage.self, forKey: .responseLanguage) ?? .russian
+        ttsProvider = try container.decodeIfPresent(CompanionTTSProvider.self, forKey: .ttsProvider) ?? .system
+        piperExecutablePath = try container.decodeIfPresent(String.self, forKey: .piperExecutablePath) ?? "piper"
+        piperVoicesDirectory = try container.decodeIfPresent(String.self, forKey: .piperVoicesDirectory) ?? ""
+        piperModelPath = try container.decodeIfPresent(String.self, forKey: .piperModelPath) ?? ""
+        provider = try container.decodeIfPresent(CompanionLLMProvider.self, forKey: .provider) ?? .ollama
+        ollamaModel = try container.decodeIfPresent(String.self, forKey: .ollamaModel) ?? "qwen3:14b"
+        ollamaEndpoint = try container.decodeIfPresent(URL.self, forKey: .ollamaEndpoint) ?? URL(string: "http://127.0.0.1:11434/api/chat")!
+        openAIModel = try container.decodeIfPresent(String.self, forKey: .openAIModel) ?? ""
+        openAIEndpoint = try container.decodeIfPresent(URL.self, forKey: .openAIEndpoint) ?? URL(string: "https://api.openai.com/v1/chat/completions")!
+        lmStudioModel = try container.decodeIfPresent(String.self, forKey: .lmStudioModel) ?? ""
+        lmStudioEndpoint = try container.decodeIfPresent(URL.self, forKey: .lmStudioEndpoint) ?? URL(string: "http://127.0.0.1:1234/v1/chat/completions")!
+    }
+}
+
+struct PiperVoiceOption: Identifiable, Hashable {
+    let id: String
+    let displayName: String
+    let modelPath: String
 }
 
 struct CompanionModelOption: Identifiable, Hashable {

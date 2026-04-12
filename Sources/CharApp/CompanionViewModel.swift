@@ -1,6 +1,7 @@
 import Foundation
 import CoreGraphics
 import Combine
+import AppKit
 
 @MainActor
 final class CompanionViewModel: ObservableObject {
@@ -24,6 +25,11 @@ final class CompanionViewModel: ObservableObject {
     @Published var selectedModelID: String
     @Published var avatarAspectRatio: CGFloat
     @Published var avatarZoom: CGFloat
+    @Published var piperExecutablePathText: String
+    @Published var piperVoicesDirectoryText: String
+    @Published var piperModelPathText: String
+    @Published var availablePiperVoices: [PiperVoiceOption] = []
+    @Published var isInstallingPiper = false
     @Published var ollamaEndpointText: String
     @Published var openAIEndpointText: String
     @Published var lmStudioEndpointText: String
@@ -48,7 +54,7 @@ final class CompanionViewModel: ObservableObject {
     private var dragResetTask: Task<Void, Never>?
 
     init() {
-        let loadedProfile = Self.loadProfile()
+        let loadedProfile = Self.withAutoDetectedPiperPaths(Self.loadProfile())
         profile = loadedProfile
         voiceRepliesEnabled = UserDefaults.standard.object(forKey: DefaultsKey.voiceRepliesEnabled) as? Bool ?? true
         openAIAPIKey = UserDefaults.standard.string(forKey: DefaultsKey.openAIAPIKey) ?? ""
@@ -71,6 +77,9 @@ final class CompanionViewModel: ObservableObject {
         avatarAspectRatio = 0.86
         let savedZoom = CGFloat(UserDefaults.standard.double(forKey: DefaultsKey.avatarZoom))
         avatarZoom = savedZoom > 0 ? min(max(savedZoom, 0.6), 2.4) : 1.0
+        piperExecutablePathText = loadedProfile.piperExecutablePath
+        piperVoicesDirectoryText = loadedProfile.piperVoicesDirectory
+        piperModelPathText = loadedProfile.piperModelPath
         ollamaEndpointText = loadedProfile.ollamaEndpoint.absoluteString
         openAIEndpointText = loadedProfile.openAIEndpoint.absoluteString
         lmStudioEndpointText = loadedProfile.lmStudioEndpoint.absoluteString
@@ -81,6 +90,8 @@ final class CompanionViewModel: ObservableObject {
             )
         ]
 
+        autofillPiperPaths()
+        refreshPiperVoices()
         bindPresence()
     }
 
@@ -158,6 +169,13 @@ final class CompanionViewModel: ObservableObject {
         persistProfile()
     }
 
+    func setTTSProvider(_ provider: CompanionTTSProvider) {
+        guard profile.ttsProvider != provider else { return }
+        profile.ttsProvider = provider
+        status = ""
+        persistProfile()
+    }
+
     func setActiveLLMModel(_ model: String) {
         profile.setActiveModel(model)
         persistProfile()
@@ -184,6 +202,152 @@ final class CompanionViewModel: ObservableObject {
     func setVoiceRepliesEnabled(_ enabled: Bool) {
         voiceRepliesEnabled = enabled
         UserDefaults.standard.set(enabled, forKey: DefaultsKey.voiceRepliesEnabled)
+    }
+
+    func setPiperExecutablePath(_ path: String) {
+        piperExecutablePathText = path
+        profile.piperExecutablePath = path
+        status = ""
+        persistProfile()
+    }
+
+    func setPiperModelPath(_ path: String) {
+        piperModelPathText = path
+        profile.piperModelPath = path
+        status = ""
+        persistProfile()
+    }
+
+    func setPiperVoicesDirectory(_ path: String) {
+        piperVoicesDirectoryText = path
+        profile.piperVoicesDirectory = path
+        refreshPiperVoices()
+        status = ""
+        persistProfile()
+    }
+
+    func choosePiperVoicesDirectory() {
+        let panel = NSOpenPanel()
+        panel.canChooseFiles = false
+        panel.canChooseDirectories = true
+        panel.allowsMultipleSelection = false
+        panel.prompt = "Выбрать"
+        panel.message = "Выбери папку, где лежат Piper `.onnx` голоса."
+
+        if panel.runModal() == .OK, let url = panel.url {
+            setPiperVoicesDirectory(url.path)
+            autofillPiperPaths()
+        }
+    }
+
+    func selectPiperVoice(_ modelPath: String) {
+        piperModelPathText = modelPath
+        profile.piperModelPath = modelPath
+        status = ""
+        persistProfile()
+    }
+
+    func autofillPiperPaths() {
+        let resolved = PiperSupport.resolvePaths(
+            configuredExecutable: profile.piperExecutablePath,
+            configuredModel: profile.piperModelPath
+        )
+
+        if let voicesDirectory = resolved.voicesDirectory {
+            piperVoicesDirectoryText = voicesDirectory
+            profile.piperVoicesDirectory = voicesDirectory
+        }
+
+        if let executablePath = resolved.executablePath {
+            piperExecutablePathText = executablePath
+            profile.piperExecutablePath = executablePath
+        }
+
+        if let modelPath = resolved.modelPath {
+            piperModelPathText = modelPath
+            profile.piperModelPath = modelPath
+        }
+
+        refreshPiperVoices()
+        persistProfile()
+
+        if resolved.executablePath != nil && resolved.modelPath != nil {
+            status = "Piper найден и пути подставлены автоматически."
+        } else if resolved.executablePath != nil {
+            status = "Piper найден, но voice model пока не найдена."
+        } else {
+            status = "Локальный Piper пока не найден."
+        }
+    }
+
+    func installPiperAutomatically() async {
+        isInstallingPiper = true
+        status = "Устанавливаю Piper локально..."
+
+        do {
+            let resolved = try await Task.detached(priority: .userInitiated) {
+                try PiperSupport.installLocalPiper()
+            }.value
+
+            if let executablePath = resolved.executablePath {
+                piperExecutablePathText = executablePath
+                profile.piperExecutablePath = executablePath
+            }
+
+            if let voicesDirectory = resolved.voicesDirectory {
+                piperVoicesDirectoryText = voicesDirectory
+                profile.piperVoicesDirectory = voicesDirectory
+            }
+
+            if let modelPath = resolved.modelPath {
+                piperModelPathText = modelPath
+                profile.piperModelPath = modelPath
+            }
+
+            refreshPiperVoices()
+            persistProfile()
+            status = "Piper установлен и готов к использованию."
+        } catch {
+            status = error.localizedDescription
+        }
+
+        isInstallingPiper = false
+    }
+
+    var piperStatusSummary: String {
+        let resolved = PiperSupport.resolvePaths(
+            configuredExecutable: profile.piperExecutablePath,
+            configuredModel: profile.piperModelPath
+        )
+
+        switch (resolved.executablePath != nil, resolved.modelPath != nil) {
+        case (true, true):
+            return "Piper найден: бинарник и голосовая модель готовы."
+        case (true, false):
+            return "Piper найден, но голосовая модель еще не настроена."
+        case (false, true):
+            return "Голосовая модель найдена, но бинарник Piper не найден."
+        case (false, false):
+            return "Piper пока не найден в системе или в локальной папке проекта."
+        }
+    }
+
+    func refreshPiperVoices() {
+        let directory = profile.piperVoicesDirectory.trimmingCharacters(in: .whitespacesAndNewlines)
+        if !directory.isEmpty {
+            availablePiperVoices = PiperSupport.discoverVoices(in: directory)
+        } else if let autoDirectory = PiperSupport.resolveVoicesDirectory() {
+            availablePiperVoices = PiperSupport.discoverVoices(in: autoDirectory)
+        } else {
+            availablePiperVoices = []
+        }
+
+        if !availablePiperVoices.contains(where: { $0.modelPath == profile.piperModelPath }),
+           let first = availablePiperVoices.first {
+            profile.piperModelPath = first.modelPath
+            piperModelPathText = first.modelPath
+            persistProfile()
+        }
     }
 
     func setOpenAIAPIKey(_ key: String) {
@@ -262,6 +426,11 @@ final class CompanionViewModel: ObservableObject {
         isRefreshingLLMModels = false
     }
 
+    func previewVoice() {
+        status = ""
+        speech.previewVoice(profile: profile)
+    }
+
     func generateStartupGreetingIfNeeded() async {
         guard visibleMessages.isEmpty else { return }
         guard !profile.activeModel.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else { return }
@@ -296,7 +465,7 @@ final class CompanionViewModel: ObservableObject {
             messages.append(ChatMessage(role: .assistant, text: reply))
             setEmotion(for: reply)
             if voiceRepliesEnabled {
-                speech.speak(reply)
+                speech.speak(reply, profile: profile)
             } else {
                 presenceState = .speaking
                 Task { [weak self] in
@@ -387,6 +556,14 @@ final class CompanionViewModel: ObservableObject {
             }
             .store(in: &cancellables)
 
+        speech.$lastStatusMessage
+            .receive(on: RunLoop.main)
+            .sink { [weak self] message in
+                guard let self, !message.isEmpty else { return }
+                self.status = message
+            }
+            .store(in: &cancellables)
+
         $profile
             .dropFirst()
             .sink { [weak self] _ in
@@ -438,6 +615,29 @@ final class CompanionViewModel: ObservableObject {
         }
 
         return profile
+    }
+
+    private static func withAutoDetectedPiperPaths(_ profile: CompanionProfile) -> CompanionProfile {
+        var updated = profile
+        let fileManager = FileManager.default
+        let bundledPiperExecutable = URL(fileURLWithPath: FileManager.default.currentDirectoryPath)
+            .appendingPathComponent(".venv-piper/bin/piper")
+            .path
+        let bundledPiperModel = AppEnvironment.assetsRootURL
+            .appendingPathComponent("TTS/Piper/ru_RU-irina-medium/ru_RU-irina-medium.onnx")
+            .path
+
+        if (updated.piperExecutablePath == "piper" || updated.piperExecutablePath.isEmpty),
+           fileManager.isExecutableFile(atPath: bundledPiperExecutable) {
+            updated.piperExecutablePath = bundledPiperExecutable
+        }
+
+        if updated.piperModelPath.isEmpty,
+           fileManager.fileExists(atPath: bundledPiperModel) {
+            updated.piperModelPath = bundledPiperModel
+        }
+
+        return updated
     }
 
     private func updatePresence() {
