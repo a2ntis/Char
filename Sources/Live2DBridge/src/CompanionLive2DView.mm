@@ -142,6 +142,11 @@ CubismFramework::Option gOption;
 
 - (BOOL)isOpaque { return NO; }
 
+- (BOOL)acceptsFirstMouse:(NSEvent *)event
+{
+    return YES;
+}
+
 - (void)prepareOpenGL
 {
     [super prepareOpenGL];

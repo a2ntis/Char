@@ -4,10 +4,16 @@ import SwiftUI
 
 @MainActor
 final class CompanionWindowCoordinator: NSObject, NSWindowDelegate {
+    private enum PanelRole {
+        case avatar
+        case bubble
+    }
+
     private let viewModel: CompanionViewModel
     private var avatarPanel: CompanionPanel?
     private var bubblePanel: CompanionPanel?
     private var cancellables: Set<AnyCancellable> = []
+    private var lastBubbleToggleAt = Date.distantPast
 
     init(viewModel: CompanionViewModel) {
         self.viewModel = viewModel
@@ -40,8 +46,7 @@ final class CompanionWindowCoordinator: NSObject, NSWindowDelegate {
         avatarPanel.makeKeyAndOrderFront(nil)
 
         if bubblePanel?.isVisible == true {
-            positionBubble(relativeTo: newFrame)
-            bubblePanel?.orderFrontRegardless()
+            hideBubble()
         }
 
         NSApplication.shared.activate(ignoringOtherApps: true)
@@ -49,15 +54,19 @@ final class CompanionWindowCoordinator: NSObject, NSWindowDelegate {
 
     func toggleBubble() {
         guard let avatarPanel else { return }
+        let now = Date()
+        guard now.timeIntervalSince(lastBubbleToggleAt) > 0.18 else { return }
+        lastBubbleToggleAt = now
+
         if bubblePanel?.isVisible == true {
-            bubblePanel?.orderOut(nil)
-            viewModel.isBubbleVisible = false
+            hideBubble()
         } else {
             let bubble = bubblePanel ?? makeBubblePanel()
             bubblePanel = bubble
             positionBubble(relativeTo: avatarPanel.frame)
             bubble.orderFront(nil)
             bubble.makeKeyAndOrderFront(nil)
+            avatarPanel.orderFrontRegardless()
             NSApplication.shared.activate(ignoringOtherApps: true)
             viewModel.isBubbleVisible = true
         }
@@ -67,7 +76,7 @@ final class CompanionWindowCoordinator: NSObject, NSWindowDelegate {
         guard let window = notification.object as? NSWindow, window == avatarPanel else { return }
         viewModel.pulseDragging()
         if bubblePanel?.isVisible == true {
-            positionBubble(relativeTo: window.frame)
+            hideBubble()
         }
     }
 
@@ -79,7 +88,7 @@ final class CompanionWindowCoordinator: NSObject, NSWindowDelegate {
             backing: .buffered,
             defer: false
         )
-        configure(panel: panel)
+        configure(panel: panel, role: .avatar)
         panel.isMovableByWindowBackground = true
         panel.delegate = self
         panel.contentView = AvatarPanelContentView(viewModel: viewModel) { [weak self] in
@@ -96,13 +105,13 @@ final class CompanionWindowCoordinator: NSObject, NSWindowDelegate {
             backing: .buffered,
             defer: false
         )
-        configure(panel: panel)
+        configure(panel: panel, role: .bubble)
         panel.contentView = NSHostingView(rootView: BubblePanelView(viewModel: viewModel))
         return panel
     }
 
-    private func configure(panel: CompanionPanel) {
-        panel.level = .floating
+    private func configure(panel: CompanionPanel, role: PanelRole) {
+        panel.level = role == .avatar ? .statusBar : .floating
         panel.isOpaque = false
         panel.backgroundColor = .clear
         panel.hasShadow = false
@@ -113,6 +122,11 @@ final class CompanionWindowCoordinator: NSObject, NSWindowDelegate {
         panel.standardWindowButton(.miniaturizeButton)?.isHidden = true
         panel.standardWindowButton(.zoomButton)?.isHidden = true
         panel.hidesOnDeactivate = false
+    }
+
+    private func hideBubble() {
+        bubblePanel?.orderOut(nil)
+        viewModel.isBubbleVisible = false
     }
 
     private func initialAvatarFrame() -> NSRect {
