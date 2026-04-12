@@ -1,0 +1,9 @@
+.DS_Store
+.build/
+.swiftpm/
+.vscode/
+Live2D/build/
+
+*.zip
+char_debug*.png
+char_fit_debug.png

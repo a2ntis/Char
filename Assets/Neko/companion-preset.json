@@ -1,0 +1,63 @@
+{
+  "extraEmotionButtons": [
+    {
+      "id": "neko-love",
+      "label": "Love",
+      "hints": ["EXP 1 [LOVE].exp3.json", "LOVE"]
+    },
+    {
+      "id": "neko-excited",
+      "label": "Excited",
+      "hints": ["EXP 2 [EXCITED].exp3.json", "EXCITED"]
+    },
+    {
+      "id": "neko-sad",
+      "label": "Sad",
+      "hints": ["EXP 3 [SAD].exp3.json", "SAD"]
+    },
+    {
+      "id": "neko-pout",
+      "label": "Pout",
+      "hints": ["EXP 4 [POUT].exp3.json", "POUT"]
+    },
+    {
+      "id": "neko-angry",
+      "label": "Angry",
+      "hints": ["EXP 5 [ANGRY].exp3.json", "ANGRY"]
+    },
+    {
+      "id": "neko-shocked",
+      "label": "Shocked",
+      "hints": ["EXP 6 [SHOCKED].exp3.json", "SHOCKED"]
+    },
+    {
+      "id": "neko-confused",
+      "label": "Confused",
+      "hints": ["EXP 7 [CONFUSED].exp3.json", "CONFUSED"]
+    },
+    {
+      "id": "neko-scared",
+      "label": "Scared",
+      "hints": ["EXP 8 [SCARED].exp3.json", "SCARED"]
+    },
+    {
+      "id": "neko-blush",
+      "label": "Blush",
+      "hints": ["EXP 9 [BLUSH].exp3.json", "BLUSH"]
+    },
+    {
+      "id": "neko-yandere",
+      "label": "Yandere",
+      "hints": ["EXP 10 [YANDERE].exp3.json", "YANDERE"]
+    }
+  ],
+  "emotionExpressions": {
+    "neutral": ["idle.exp3.json", "idle"],
+    "happy": ["EXP 1 [LOVE].exp3.json", "LOVE", "EXP 2 [EXCITED].exp3.json"],
+    "excited": ["EXP 2 [EXCITED].exp3.json", "EXCITED", "EXP 6 [SHOCKED].exp3.json", "SHOCKED"],
+    "shy": ["EXP 9 [BLUSH].exp3.json", "BLUSH", "EXP 1 [LOVE].exp3.json"],
+    "thinking": ["EXP 7 [CONFUSED].exp3.json", "CONFUSED", "idle.exp3.json"],
+    "sleepy": ["EXP 3 [SAD].exp3.json", "SAD"],
+    "angry": ["EXP 5 [ANGRY].exp3.json", "ANGRY", "EXP 4 [POUT].exp3.json", "POUT"]
+  }
+}

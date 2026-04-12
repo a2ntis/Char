@@ -1,0 +1,53 @@
+{
+  "extraEmotionButtons": [
+    {
+      "id": "march-photo",
+      "label": "Photo",
+      "hints": ["3.exp3.json", "照相"]
+    },
+    {
+      "id": "march-peace",
+      "label": "Peace",
+      "hints": ["2.exp3.json", "比耶"]
+    },
+    {
+      "id": "march-blush",
+      "label": "Blush",
+      "hints": ["4.exp3.json", "脸红"]
+    },
+    {
+      "id": "march-shy",
+      "label": "Cover Face",
+      "hints": ["1.exp3.json", "捂脸"]
+    },
+    {
+      "id": "march-sweat",
+      "label": "Sweat",
+      "hints": ["7.exp3.json", "流汗"]
+    },
+    {
+      "id": "march-shock",
+      "label": "Stars",
+      "hints": ["8.exp3.json", "星星"]
+    },
+    {
+      "id": "march-dark",
+      "label": "Dark Face",
+      "hints": ["5.exp3.json", "黑脸"]
+    },
+    {
+      "id": "march-cry",
+      "label": "Cry",
+      "hints": ["6.exp3.json", "哭"]
+    }
+  ],
+  "emotionExpressions": {
+    "neutral": ["3.exp3.json", "照相", "2.exp3.json", "比耶"],
+    "happy": ["2.exp3.json", "比耶", "8.exp3.json", "星星"],
+    "excited": ["8.exp3.json", "星星", "3.exp3.json", "照相"],
+    "shy": ["4.exp3.json", "脸红", "1.exp3.json", "捂脸"],
+    "thinking": ["7.exp3.json", "流汗", "1.exp3.json", "捂脸"],
+    "sleepy": ["6.exp3.json", "哭", "5.exp3.json", "黑脸"],
+    "angry": ["5.exp3.json", "黑脸"]
+  }
+}

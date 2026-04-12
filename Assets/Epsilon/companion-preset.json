@@ -1,0 +1,33 @@
+{
+  "extraEmotionButtons": [
+    {
+      "id": "epsilon-angry",
+      "label": "Angry",
+      "hints": ["Angry.exp3.json", "Angry"]
+    },
+    {
+      "id": "epsilon-blushing",
+      "label": "Blushing",
+      "hints": ["Blushing.exp3.json", "Blushing"]
+    },
+    {
+      "id": "epsilon-sad",
+      "label": "Sad",
+      "hints": ["Sad.exp3.json", "Sad", "f01.exp3.json", "f02.exp3.json"]
+    },
+    {
+      "id": "epsilon-surprised",
+      "label": "Surprised",
+      "hints": ["Surprised.exp3.json", "Surprised"]
+    }
+  ],
+  "emotionExpressions": {
+    "neutral": ["Normal.exp3.json", "Normal"],
+    "happy": ["Smile.exp3.json", "Smile"],
+    "excited": ["Surprised.exp3.json", "Surprised", "Smile.exp3.json"],
+    "shy": ["Blushing.exp3.json", "Blushing"],
+    "thinking": ["f01.exp3.json", "f01", "Normal.exp3.json"],
+    "sleepy": ["Sad.exp3.json", "Sad"],
+    "angry": ["Angry.exp3.json", "Angry", "f02.exp3.json", "f02"]
+  }
+}
