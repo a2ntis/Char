@@ -37,7 +37,7 @@ final class CompanionViewModel: ObservableObject {
     private var dragResetTask: Task<Void, Never>?
 
     init() {
-        let assetsRoot = URL(fileURLWithPath: FileManager.default.currentDirectoryPath).appendingPathComponent("Assets")
+        let assetsRoot = AppEnvironment.assetsRootURL
         let discoveredModels = ModelCatalog.discoverModels(in: assetsRoot)
         let fallbackModel = CompanionModelOption(
             id: assetsRoot.appendingPathComponent("shizuku/runtime").path,

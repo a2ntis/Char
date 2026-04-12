@@ -3,6 +3,7 @@
 .swiftpm/
 .vscode/
 Live2D/build/
+dist/
 
 *.zip
 char_debug*.png

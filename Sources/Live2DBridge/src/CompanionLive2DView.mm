@@ -15,6 +15,19 @@ namespace {
 bool gCubismInitialized = false;
 LAppAllocator_Common gAllocator;
 CubismFramework::Option gOption;
+
+NSString *ResourceRootPath(void)
+{
+    NSURL *resourceURL = NSBundle.mainBundle.resourceURL;
+    if (resourceURL) {
+        NSString *assetsPath = [[resourceURL path] stringByAppendingPathComponent:@"Assets"];
+        if ([[NSFileManager defaultManager] fileExistsAtPath:assetsPath]) {
+            return [resourceURL path];
+        }
+    }
+
+    return NSFileManager.defaultManager.currentDirectoryPath;
+}
 }
 
 @interface CompanionLive2DView ()
@@ -133,7 +146,7 @@ CubismFramework::Option gOption;
     NSOpenGLPixelFormat *format = [[NSOpenGLPixelFormat alloc] initWithAttributes:attrs];
     self = [super initWithFrame:frameRect pixelFormat:format];
     if (self) {
-        _assetRootPath = [NSFileManager.defaultManager.currentDirectoryPath stringByAppendingPathComponent:@"Assets/shizuku/runtime"];
+        _assetRootPath = [ResourceRootPath() stringByAppendingPathComponent:@"Assets/shizuku/runtime"];
         self.wantsBestResolutionOpenGLSurface = YES;
         _lastDrawableSize = NSZeroSize;
     }
@@ -174,7 +187,8 @@ CubismFramework::Option gOption;
         gCubismInitialized = true;
     }
 
-    LAppPal::SetExecutableAbsolutePath(std::string([NSFileManager.defaultManager.currentDirectoryPath UTF8String]) + "/");
+    NSString *resourceRootPath = ResourceRootPath();
+    LAppPal::SetExecutableAbsolutePath(std::string([resourceRootPath UTF8String]) + "/");
 
     _view = std::make_unique<LAppView_Common>();
     _view->Initialize((int)self.bounds.size.width, (int)self.bounds.size.height);

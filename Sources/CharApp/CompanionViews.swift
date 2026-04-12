@@ -132,44 +132,49 @@ struct BubblePanelView: View {
     }
 
     private var inputBar: some View {
-        ZStack(alignment: .trailing) {
-            TextField("Напиши мне реплику…", text: $viewModel.draft, axis: .vertical)
-                .textFieldStyle(.plain)
-                .lineLimit(1 ... 4)
-                .font(.system(size: 16, weight: .medium, design: .rounded))
-                .foregroundStyle(Color.black.opacity(0.9))
-                .tint(.black)
-                .padding(.leading, 18)
-                .padding(.trailing, 52)
-                .padding(.vertical, 13)
-                .frame(width: 292, alignment: .leading)
-                .frame(minHeight: 68)
-                .fixedSize(horizontal: false, vertical: true)
-                .focused($inputFocused)
-                .background(Color.white.opacity(0.82), in: RoundedRectangle(cornerRadius: 20, style: .continuous))
-                .overlay {
-                    RoundedRectangle(cornerRadius: 20, style: .continuous)
-                        .stroke(Color.black.opacity(0.92), lineWidth: 1.7)
-                }
-                .onSubmit {
-                    Task { await viewModel.sendCurrentDraft() }
-                }
+        HStack(spacing: 0) {
+            ZStack(alignment: .trailing) {
+                TextField("Напиши мне реплику…", text: $viewModel.draft, axis: .vertical)
+                    .textFieldStyle(.plain)
+                    .lineLimit(1 ... 4)
+                    .font(.system(size: 16, weight: .medium, design: .rounded))
+                    .foregroundStyle(Color.white.opacity(0.96))
+                    .tint(.white)
+                    .padding(.leading, 18)
+                    .padding(.trailing, 52)
+                    .padding(.vertical, 13)
+                    .frame(width: 276, alignment: .leading)
+                    .frame(minHeight: 68)
+                    .fixedSize(horizontal: false, vertical: true)
+                    .focused($inputFocused)
+                    .background(Color.black.opacity(0.78), in: RoundedRectangle(cornerRadius: 20, style: .continuous))
+                    .overlay {
+                        RoundedRectangle(cornerRadius: 20, style: .continuous)
+                            .stroke(Color.white.opacity(0.22), lineWidth: 1.2)
+                    }
+                    .onSubmit {
+                        Task { await viewModel.sendCurrentDraft() }
+                    }
 
-            Button {
-                Task { await viewModel.toggleListening() }
-            } label: {
-                Image(systemName: viewModel.speech.isListening ? "waveform.circle.fill" : "mic.fill")
-                    .font(.system(size: 18, weight: .bold))
-                    .foregroundStyle(viewModel.speech.isListening ? Color(red: 0.72, green: 0.18, blue: 0.30) : .black)
-                    .frame(width: 34, height: 34)
-                    .background(
-                        (viewModel.speech.isListening ? Color(red: 1.0, green: 0.88, blue: 0.91) : Color.clear),
-                        in: Circle()
-                    )
+                Button {
+                    Task { await viewModel.toggleListening() }
+                } label: {
+                    Image(systemName: viewModel.speech.isListening ? "waveform.circle.fill" : "mic.fill")
+                        .font(.system(size: 18, weight: .bold))
+                        .foregroundStyle(.white)
+                        .frame(width: 34, height: 34)
+                        .background(
+                            (viewModel.speech.isListening ? Color(red: 0.72, green: 0.18, blue: 0.30).opacity(0.9) : Color.clear),
+                            in: Circle()
+                        )
+                }
+                .buttonStyle(.plain)
+                .padding(.trailing, 12)
             }
-            .buttonStyle(.plain)
-            .padding(.trailing, 12)
+
+            Spacer(minLength: 54)
         }
+        .frame(maxWidth: .infinity, alignment: .leading)
     }
 }
 
