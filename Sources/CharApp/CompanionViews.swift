@@ -495,6 +495,7 @@ struct MessageBubble: View {
             Text(message.text)
                 .font(.system(size: 16, weight: .medium, design: .rounded))
                 .foregroundStyle(.black.opacity(0.9))
+                .textSelection(.enabled)
                 .multilineTextAlignment(message.role == .assistant ? .leading : .trailing)
                 .frame(maxWidth: .infinity, alignment: message.role == .assistant ? .leading : .trailing)
         }

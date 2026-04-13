@@ -65,7 +65,8 @@ actor OpenAIClient {
                 model: trimmedModel,
                 messages: messages.map {
                     OpenAIChatRequest.Message(role: $0.role.rawValue, content: $0.text)
-                }
+                },
+                stream: nil
             )
         )
 
@@ -86,6 +87,67 @@ actor OpenAIClient {
         return content
     }
 
+    func stream(
+        messages: [ChatMessage],
+        profile: CompanionProfile,
+        apiKey: String,
+        onDelta: @escaping @Sendable (String) async -> Void
+    ) async throws -> String {
+        let trimmedKey = apiKey.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !trimmedKey.isEmpty else {
+            throw CompanionError.missingAPIKey("OpenAI")
+        }
+
+        let trimmedModel = profile.activeModel.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !trimmedModel.isEmpty else {
+            throw CompanionError.missingModel("OpenAI")
+        }
+
+        var request = URLRequest(url: profile.activeEndpoint)
+        request.httpMethod = "POST"
+        request.setValue("application/json", forHTTPHeaderField: "Content-Type")
+        request.setValue("Bearer \(trimmedKey)", forHTTPHeaderField: "Authorization")
+        request.httpBody = try JSONEncoder().encode(
+            OpenAIChatRequest(
+                model: trimmedModel,
+                messages: messages.map {
+                    OpenAIChatRequest.Message(role: $0.role.rawValue, content: $0.text)
+                },
+                stream: true
+            )
+        )
+
+        let (bytes, response) = try await URLSession.shared.bytes(for: request)
+        guard let httpResponse = response as? HTTPURLResponse else {
+            throw CompanionError.invalidResponse
+        }
+        guard (200 ... 299).contains(httpResponse.statusCode) else {
+            throw CompanionError.server("Unknown server error")
+        }
+
+        var collected = ""
+
+        for try await line in bytes.lines {
+            let trimmed = line.trimmingCharacters(in: .whitespacesAndNewlines)
+            guard trimmed.hasPrefix("data:") else { continue }
+            let payload = trimmed.dropFirst(5).trimmingCharacters(in: .whitespacesAndNewlines)
+            if payload == "[DONE]" { break }
+            guard let jsonData = payload.data(using: .utf8) else { continue }
+            if let delta = try? JSONDecoder().decode(OpenAIChatStreamResponse.self, from: jsonData),
+               let content = delta.choices.first?.delta.content,
+               !content.isEmpty {
+                collected += content
+                await onDelta(content)
+            }
+        }
+
+        let result = collected.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !result.isEmpty else {
+            throw CompanionError.invalidResponse
+        }
+        return result
+    }
+
     func sendWithoutAuthorization(messages: [ChatMessage], profile: CompanionProfile) async throws -> String {
         let trimmedModel = profile.activeModel.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !trimmedModel.isEmpty else {
@@ -102,7 +164,8 @@ actor OpenAIClient {
                 model: trimmedModel,
                 messages: normalizedMessages.map {
                     OpenAIChatRequest.Message(role: $0.role.rawValue, content: $0.text)
-                }
+                },
+                stream: nil
             )
         )
 
@@ -121,6 +184,62 @@ actor OpenAIClient {
             throw CompanionError.invalidResponse
         }
         return content
+    }
+
+    func streamWithoutAuthorization(
+        messages: [ChatMessage],
+        profile: CompanionProfile,
+        onDelta: @escaping @Sendable (String) async -> Void
+    ) async throws -> String {
+        let trimmedModel = profile.activeModel.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !trimmedModel.isEmpty else {
+            throw CompanionError.missingModel("LM Studio")
+        }
+
+        let normalizedMessages = normalizeMessagesForAlternatingTemplate(messages)
+
+        var request = URLRequest(url: profile.activeEndpoint)
+        request.httpMethod = "POST"
+        request.setValue("application/json", forHTTPHeaderField: "Content-Type")
+        request.httpBody = try JSONEncoder().encode(
+            OpenAIChatRequest(
+                model: trimmedModel,
+                messages: normalizedMessages.map {
+                    OpenAIChatRequest.Message(role: $0.role.rawValue, content: $0.text)
+                },
+                stream: true
+            )
+        )
+
+        let (bytes, response) = try await URLSession.shared.bytes(for: request)
+        guard let httpResponse = response as? HTTPURLResponse else {
+            throw CompanionError.invalidResponse
+        }
+        guard (200 ... 299).contains(httpResponse.statusCode) else {
+            throw CompanionError.server("Unknown server error")
+        }
+
+        var collected = ""
+
+        for try await line in bytes.lines {
+            let trimmed = line.trimmingCharacters(in: .whitespacesAndNewlines)
+            guard trimmed.hasPrefix("data:") else { continue }
+            let payload = trimmed.dropFirst(5).trimmingCharacters(in: .whitespacesAndNewlines)
+            if payload == "[DONE]" { break }
+            guard let jsonData = payload.data(using: .utf8) else { continue }
+            if let delta = try? JSONDecoder().decode(OpenAIChatStreamResponse.self, from: jsonData),
+               let content = delta.choices.first?.delta.content,
+               !content.isEmpty {
+                collected += content
+                await onDelta(content)
+            }
+        }
+
+        let result = collected.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !result.isEmpty else {
+            throw CompanionError.invalidResponse
+        }
+        return result
     }
 
     func listModels(endpoint: URL, apiKey: String) async throws -> [String] {
@@ -247,6 +366,22 @@ actor CompanionChatClient {
         }
     }
 
+    func stream(
+        messages: [ChatMessage],
+        profile: CompanionProfile,
+        openAIKey: String,
+        onDelta: @escaping @Sendable (String) async -> Void
+    ) async throws -> String {
+        switch profile.provider {
+        case .ollama:
+            return try await ollama.send(messages: messages, profile: profile)
+        case .openAI:
+            return try await openAI.stream(messages: messages, profile: profile, apiKey: openAIKey, onDelta: onDelta)
+        case .lmStudio:
+            return try await openAI.streamWithoutAuthorization(messages: messages, profile: profile, onDelta: onDelta)
+        }
+    }
+
     func listOllamaModels(endpoint: URL) async throws -> [String] {
         try await ollama.listModels(endpoint: endpoint)
     }
@@ -333,6 +468,7 @@ private struct OpenAIChatRequest: Encodable {
 
     let model: String
     let messages: [Message]
+    let stream: Bool?
 }
 
 private struct OpenAIChatResponse: Decodable {
@@ -343,6 +479,18 @@ private struct OpenAIChatResponse: Decodable {
         }
 
         let message: Message
+    }
+
+    let choices: [Choice]
+}
+
+private struct OpenAIChatStreamResponse: Decodable {
+    struct Choice: Decodable {
+        struct Delta: Decodable {
+            let content: String?
+        }
+
+        let delta: Delta
     }
 
     let choices: [Choice]

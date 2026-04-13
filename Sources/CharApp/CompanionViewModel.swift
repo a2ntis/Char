@@ -639,10 +639,25 @@ final class CompanionViewModel: ObservableObject {
         updatePresence()
 
         messages.append(ChatMessage(role: .user, text: text))
+        let assistantPlaceholder = ChatMessage(role: .assistant, text: "")
+        messages.append(assistantPlaceholder)
+
+        var streamedReply = ""
 
         do {
-            let reply = try await client.send(messages: conversationMessages, profile: profile, openAIKey: openAIAPIKey)
-            messages.append(ChatMessage(role: .assistant, text: reply))
+            let reply = try await client.stream(messages: conversationMessages, profile: profile, openAIKey: openAIAPIKey) { [weak self] delta in
+                await MainActor.run {
+                    guard let self else { return }
+                    streamedReply += delta
+                    if let lastIndex = self.messages.indices.last {
+                        self.messages[lastIndex] = ChatMessage(role: .assistant, text: streamedReply)
+                    }
+                }
+            }
+
+            if let lastIndex = messages.indices.last {
+                messages[lastIndex] = ChatMessage(role: .assistant, text: reply)
+            }
             setEmotion(for: reply)
             if voiceRepliesEnabled {
                 speech.speak(reply, profile: profile, openAIAPIKey: openAIAPIKey)
@@ -657,7 +672,11 @@ final class CompanionViewModel: ObservableObject {
             }
         } catch {
             status = error.localizedDescription
-            messages.append(ChatMessage(role: .assistant, text: "Я сейчас немного задумалась и не смогла ответить. Попробуй еще раз через секунду."))
+            if let lastIndex = messages.indices.last, messages[lastIndex].role == .assistant, messages[lastIndex].text.isEmpty {
+                messages[lastIndex] = ChatMessage(role: .assistant, text: "Я сейчас немного задумалась и не смогла ответить. Попробуй еще раз через секунду.")
+            } else {
+                messages.append(ChatMessage(role: .assistant, text: "Я сейчас немного задумалась и не смогла ответить. Попробуй еще раз через секунду."))
+            }
         }
 
         isSending = false

@@ -17,6 +17,13 @@ final class SpeechCoordinator: NSObject, ObservableObject, @unchecked Sendable, 
     private var audioPlayer: AVAudioPlayer?
     private var currentAudioFileURL: URL?
     private var currentSpeechProcess: Process?
+    private var openAITTSSessionID: UUID?
+    private var openAIPendingChunkFiles: [Int: URL] = [:]
+    private var openAIFailedChunkIndexes: Set<Int> = []
+    private var openAINextChunkIndexToPlay = 0
+    private var openAITotalChunkCount = 0
+    private var openAICompletedChunkCount = 0
+    private var openAIHadChunkFailure = false
 
     override init() {
         super.init()
@@ -271,10 +278,11 @@ final class SpeechCoordinator: NSObject, ObservableObject, @unchecked Sendable, 
             updateStatus("Для OpenAI TTS нужен API key.")
             return
         }
-
-        let outputURL = FileManager.default.temporaryDirectory
-            .appendingPathComponent("char-openai-tts-\(UUID().uuidString)")
-            .appendingPathExtension("wav")
+        let chunks = speechChunks(for: text)
+        guard !chunks.isEmpty else {
+            updateStatus("OpenAI TTS не получил текста для озвучки.")
+            return
+        }
 
         let model = profile.openAITTSModel.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
             ? "gpt-4o-mini-tts"
@@ -323,51 +331,176 @@ final class SpeechCoordinator: NSObject, ObservableObject, @unchecked Sendable, 
             return
         }
 
+        let sessionID = UUID()
+        openAITTSSessionID = sessionID
+        openAIPendingChunkFiles = [:]
+        openAIFailedChunkIndexes = []
+        openAINextChunkIndexToPlay = 0
+        openAITotalChunkCount = chunks.count
+        openAICompletedChunkCount = 0
+        openAIHadChunkFailure = false
         setSpeaking(true)
-        updateStatus("OpenAI TTS синтезирует речь...")
+        updateStatus("OpenAI TTS готовит первую фразу...")
+
+        for (index, chunk) in chunks.enumerated() {
+            requestOpenAIChunk(
+                chunk,
+                chunkIndex: index,
+                sessionID: sessionID,
+                model: model,
+                voice: voice,
+                speed: min(max(profile.openAITTSSpeed, 0.25), 4.0),
+                instructions: instructions.isEmpty ? nil : instructions,
+                endpoint: profile.openAITTSEndpoint,
+                apiKey: trimmedKey
+            )
+        }
+    }
+
+    private func requestOpenAIChunk(
+        _ chunk: String,
+        chunkIndex: Int,
+        sessionID: UUID,
+        model: String,
+        voice: String,
+        speed: Double,
+        instructions: String?,
+        endpoint: URL,
+        apiKey: String
+    ) {
+        let outputURL = FileManager.default.temporaryDirectory
+            .appendingPathComponent("char-openai-tts-\(sessionID.uuidString)-\(chunkIndex)")
+            .appendingPathExtension("wav")
+
+        struct RequestBody: Encodable {
+            let model: String
+            let voice: String
+            let input: String
+            let format: String
+            let speed: Double
+            let instructions: String?
+
+            enum CodingKeys: String, CodingKey {
+                case model
+                case voice
+                case input
+                case format = "response_format"
+                case speed
+                case instructions
+            }
+        }
+
+        var request = URLRequest(url: endpoint)
+        request.httpMethod = "POST"
+        request.setValue("Bearer \(apiKey)", forHTTPHeaderField: "Authorization")
+        request.setValue("application/json", forHTTPHeaderField: "Content-Type")
+
+        do {
+            request.httpBody = try JSONEncoder().encode(
+                RequestBody(
+                    model: model,
+                    voice: voice,
+                    input: chunk,
+                    format: "wav",
+                    speed: speed,
+                    instructions: instructions
+                )
+            )
+        } catch {
+            handleOpenAIChunkFailure(chunkIndex: chunkIndex, sessionID: sessionID, message: "Не удалось подготовить OpenAI TTS запрос: \(error.localizedDescription)")
+            return
+        }
 
         URLSession.shared.dataTask(with: request) { [weak self] data, response, error in
+            guard let self else { return }
+
             if let error {
-                DispatchQueue.main.async {
-                    self?.setSpeaking(false)
-                    self?.cleanupAudioFile()
-                    self?.updateStatus(error.localizedDescription)
-                }
+                self.handleOpenAIChunkFailure(chunkIndex: chunkIndex, sessionID: sessionID, message: error.localizedDescription)
                 return
             }
 
             guard let data, let httpResponse = response as? HTTPURLResponse else {
-                DispatchQueue.main.async {
-                    self?.setSpeaking(false)
-                    self?.cleanupAudioFile()
-                    self?.updateStatus(OpenAITTSError.invalidResponse.localizedDescription)
-                }
+                self.handleOpenAIChunkFailure(chunkIndex: chunkIndex, sessionID: sessionID, message: OpenAITTSError.invalidResponse.localizedDescription)
                 return
             }
 
             guard (200..<300).contains(httpResponse.statusCode) else {
-                DispatchQueue.main.async {
-                    self?.setSpeaking(false)
-                    self?.cleanupAudioFile()
-                    self?.updateStatus(Self.extractOpenAIError(from: data))
-                }
+                self.handleOpenAIChunkFailure(chunkIndex: chunkIndex, sessionID: sessionID, message: Self.extractOpenAIError(from: data))
                 return
             }
 
             do {
                 try data.write(to: outputURL)
                 DispatchQueue.main.async {
-                    self?.updateStatus("OpenAI TTS сгенерировал речь.")
-                    self?.playGeneratedAudio(from: outputURL)
+                    guard self.openAITTSSessionID == sessionID else {
+                        try? FileManager.default.removeItem(at: outputURL)
+                        return
+                    }
+                    self.openAIPendingChunkFiles[chunkIndex] = outputURL
+                    self.openAICompletedChunkCount += 1
+                    if chunkIndex == 0 {
+                        self.updateStatus("OpenAI TTS сгенерировал первую фразу.")
+                    }
+                    self.playNextOpenAIChunkIfReady()
                 }
             } catch {
-                DispatchQueue.main.async {
-                    self?.setSpeaking(false)
-                    self?.cleanupAudioFile()
-                    self?.updateStatus(error.localizedDescription)
-                }
+                self.handleOpenAIChunkFailure(chunkIndex: chunkIndex, sessionID: sessionID, message: error.localizedDescription)
             }
         }.resume()
+    }
+
+    private func handleOpenAIChunkFailure(chunkIndex: Int, sessionID: UUID, message: String) {
+        DispatchQueue.main.async {
+            guard self.openAITTSSessionID == sessionID else { return }
+            self.openAIFailedChunkIndexes.insert(chunkIndex)
+            self.openAICompletedChunkCount += 1
+            self.openAIHadChunkFailure = true
+            if chunkIndex == 0 {
+                self.updateStatus(message)
+            }
+            self.playNextOpenAIChunkIfReady()
+        }
+    }
+
+    private func playNextOpenAIChunkIfReady() {
+        if let audioPlayer, audioPlayer.isPlaying {
+            return
+        }
+
+        while openAIFailedChunkIndexes.contains(openAINextChunkIndexToPlay) {
+            openAINextChunkIndexToPlay += 1
+        }
+
+        if let nextURL = openAIPendingChunkFiles.removeValue(forKey: openAINextChunkIndexToPlay) {
+            openAINextChunkIndexToPlay += 1
+            playGeneratedAudio(from: nextURL)
+            return
+        }
+
+        if openAICompletedChunkCount >= openAITotalChunkCount,
+           openAINextChunkIndexToPlay >= openAITotalChunkCount {
+            let hadFailure = openAIHadChunkFailure
+            resetOpenAIChunkState()
+            setSpeaking(false)
+            if hadFailure {
+                updateStatus("Часть реплики не удалось озвучить, но остальное проигралось.")
+            } else {
+                updateStatus("")
+            }
+        }
+    }
+
+    private func resetOpenAIChunkState() {
+        for url in openAIPendingChunkFiles.values {
+            try? FileManager.default.removeItem(at: url)
+        }
+        openAITTSSessionID = nil
+        openAIPendingChunkFiles = [:]
+        openAIFailedChunkIndexes = []
+        openAINextChunkIndexToPlay = 0
+        openAITotalChunkCount = 0
+        openAICompletedChunkCount = 0
+        openAIHadChunkFailure = false
     }
 
     private func resolvePiperExecutablePath(from configuredPath: String) -> String {
@@ -435,8 +568,12 @@ final class SpeechCoordinator: NSObject, ObservableObject, @unchecked Sendable, 
     }
 
     func audioPlayerDidFinishPlaying(_ player: AVAudioPlayer, successfully flag: Bool) {
-        setSpeaking(false)
         cleanupAudioFile()
+        if openAITTSSessionID != nil {
+            playNextOpenAIChunkIfReady()
+        } else {
+            setSpeaking(false)
+        }
     }
 
     func audioPlayerDecodeErrorDidOccur(_ player: AVAudioPlayer, error: Error?) {
@@ -500,6 +637,7 @@ final class SpeechCoordinator: NSObject, ObservableObject, @unchecked Sendable, 
         audioPlayer?.stop()
         audioPlayer = nil
         cleanupAudioFile()
+        resetOpenAIChunkState()
         setSpeaking(false)
     }
 
@@ -542,6 +680,52 @@ final class SpeechCoordinator: NSObject, ObservableObject, @unchecked Sendable, 
         case .english:
             return "en"
         }
+    }
+
+    private func speechChunks(for text: String) -> [String] {
+        let nsRange = text.startIndex..<text.endIndex
+        var sentences: [String] = []
+
+        text.enumerateSubstrings(in: nsRange, options: [.bySentences, .substringNotRequired]) { _, range, _, _ in
+            let sentence = text[range].trimmingCharacters(in: .whitespacesAndNewlines)
+            if !sentence.isEmpty {
+                sentences.append(sentence)
+            }
+        }
+
+        if sentences.isEmpty {
+            sentences = text
+                .split(separator: "\n")
+                .map { $0.trimmingCharacters(in: .whitespacesAndNewlines) }
+                .filter { !$0.isEmpty }
+        }
+
+        if sentences.isEmpty {
+            return [text]
+        }
+
+        var chunks: [String] = []
+        var currentChunk = ""
+        var sentencesInChunk = 0
+
+        for sentence in sentences {
+            let candidate = currentChunk.isEmpty ? sentence : "\(currentChunk) \(sentence)"
+            let shouldWrap = candidate.count > 180 || sentencesInChunk >= 2
+            if shouldWrap && !currentChunk.isEmpty {
+                chunks.append(currentChunk)
+                currentChunk = sentence
+                sentencesInChunk = 1
+            } else {
+                currentChunk = candidate
+                sentencesInChunk += 1
+            }
+        }
+
+        if !currentChunk.isEmpty {
+            chunks.append(currentChunk)
+        }
+
+        return chunks
     }
 
     private static func extractOpenAIError(from data: Data) -> String {
