@@ -16,7 +16,7 @@ final class SpeechCoordinator: NSObject, ObservableObject, @unchecked Sendable, 
     private var recognitionTask: SFSpeechRecognitionTask?
     private var audioPlayer: AVAudioPlayer?
     private var currentAudioFileURL: URL?
-    private var currentPiperProcess: Process?
+    private var currentSpeechProcess: Process?
 
     override init() {
         super.init()
@@ -42,7 +42,7 @@ final class SpeechCoordinator: NSObject, ObservableObject, @unchecked Sendable, 
         }
     }
 
-    func speak(_ text: String, profile: CompanionProfile) {
+    func speak(_ text: String, profile: CompanionProfile, openAIAPIKey: String = "") {
         let speechText = sanitizeForSpeech(text)
         guard !speechText.isEmpty else { return }
 
@@ -54,10 +54,14 @@ final class SpeechCoordinator: NSObject, ObservableObject, @unchecked Sendable, 
             speakWithSystemVoice(speechText, language: profile.responseLanguage)
         case .piper:
             speakWithPiper(speechText, executablePath: profile.piperExecutablePath, modelPath: profile.piperModelPath)
+        case .xtts:
+            speakWithXTTS(speechText, pythonPath: profile.xttsPythonPath, referencePath: profile.xttsReferencePath, language: profile.responseLanguage)
+        case .openAI:
+            speakWithOpenAI(speechText, profile: profile, apiKey: openAIAPIKey)
         }
     }
 
-    func previewVoice(profile: CompanionProfile) {
+    func previewVoice(profile: CompanionProfile, openAIAPIKey: String = "") {
         let sample: String
         switch profile.responseLanguage {
         case .russian:
@@ -68,7 +72,7 @@ final class SpeechCoordinator: NSObject, ObservableObject, @unchecked Sendable, 
             sample = "Hi. I am right here, and my voice is working."
         }
 
-        speak(sample, profile: profile)
+        speak(sample, profile: profile, openAIAPIKey: openAIAPIKey)
     }
 
     private func speakWithSystemVoice(_ text: String, language: CompanionResponseLanguage) {
@@ -149,7 +153,7 @@ final class SpeechCoordinator: NSObject, ObservableObject, @unchecked Sendable, 
         process.standardInput = stdinPipe
         process.standardOutput = stdoutPipe
         process.standardError = stderrPipe
-        currentPiperProcess = process
+        currentSpeechProcess = process
         setSpeaking(true)
         updateStatus("Piper запускается...")
 
@@ -159,7 +163,7 @@ final class SpeechCoordinator: NSObject, ObservableObject, @unchecked Sendable, 
                 .trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
 
             DispatchQueue.main.async {
-                self?.currentPiperProcess = nil
+                self?.currentSpeechProcess = nil
 
                 if process.terminationStatus != 0 {
                     self?.setSpeaking(false)
@@ -179,9 +183,191 @@ final class SpeechCoordinator: NSObject, ObservableObject, @unchecked Sendable, 
             try stdinPipe.fileHandleForWriting.close()
         } catch {
             setSpeaking(false)
-            currentPiperProcess = nil
+            currentSpeechProcess = nil
             updateStatus("Не удалось запустить Piper: \(error.localizedDescription)")
         }
+    }
+
+    private func speakWithXTTS(_ text: String, pythonPath: String, referencePath: String, language: CompanionResponseLanguage) {
+        let resolvedPython = XTTSSupport.resolvePythonPath(pythonPath)?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
+        let resolvedReference = XTTSSupport.resolveReferencePath(referencePath)?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
+
+        guard !resolvedPython.isEmpty else {
+            updateStatus("Не найден локальный XTTS python runtime.")
+            return
+        }
+
+        guard !resolvedReference.isEmpty else {
+            updateStatus("Для XTTS нужен reference voice clip.")
+            return
+        }
+
+        let referenceURL = URL(fileURLWithPath: NSString(string: resolvedReference).expandingTildeInPath)
+        guard FileManager.default.fileExists(atPath: referenceURL.path) else {
+            updateStatus("Не найден reference clip для XTTS: \(referenceURL.path)")
+            return
+        }
+
+        let outputURL = FileManager.default.temporaryDirectory
+            .appendingPathComponent("char-xtts-\(UUID().uuidString)")
+            .appendingPathExtension("wav")
+
+        let process = Process()
+        let stdoutPipe = Pipe()
+        let stderrPipe = Pipe()
+        process.executableURL = URL(fileURLWithPath: resolvedPython)
+        process.environment = {
+            var env = ProcessInfo.processInfo.environment
+            env["COQUI_TOS_AGREED"] = "1"
+            return env
+        }()
+        process.arguments = [
+            "-u",
+            "-c",
+            xttsPythonScript(outputPath: outputURL.path, referencePath: referenceURL.path, text: text, languageCode: xttsLanguageCode(for: language))
+        ]
+        process.standardOutput = stdoutPipe
+        process.standardError = stderrPipe
+        currentSpeechProcess = process
+        setSpeaking(true)
+        updateStatus("XTTS синтезирует речь...")
+
+        process.terminationHandler = { [weak self] process in
+            let stdoutData = stdoutPipe.fileHandleForReading.readDataToEndOfFile()
+            let stderrData = stderrPipe.fileHandleForReading.readDataToEndOfFile()
+            let stdoutText = String(data: stdoutData, encoding: .utf8)?
+                .trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
+            let stderrText = String(data: stderrData, encoding: .utf8)?
+                .trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
+
+            DispatchQueue.main.async {
+                self?.currentSpeechProcess = nil
+
+                guard process.terminationStatus == 0 else {
+                    self?.setSpeaking(false)
+                    self?.cleanupAudioFile()
+                    let message = [stderrText, stdoutText].first(where: { !$0.isEmpty }) ?? "XTTS завершился с ошибкой."
+                    self?.updateStatus(message)
+                    return
+                }
+
+                self?.updateStatus("XTTS сгенерировал речь.")
+                self?.playGeneratedAudio(from: outputURL)
+            }
+        }
+
+        do {
+            try process.run()
+        } catch {
+            setSpeaking(false)
+            currentSpeechProcess = nil
+            updateStatus("Не удалось запустить XTTS: \(error.localizedDescription)")
+        }
+    }
+
+    private func speakWithOpenAI(_ text: String, profile: CompanionProfile, apiKey: String) {
+        let trimmedKey = apiKey.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !trimmedKey.isEmpty else {
+            updateStatus("Для OpenAI TTS нужен API key.")
+            return
+        }
+
+        let outputURL = FileManager.default.temporaryDirectory
+            .appendingPathComponent("char-openai-tts-\(UUID().uuidString)")
+            .appendingPathExtension("wav")
+
+        let model = profile.openAITTSModel.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+            ? "gpt-4o-mini-tts"
+            : profile.openAITTSModel.trimmingCharacters(in: .whitespacesAndNewlines)
+        let voice = profile.openAITTSVoice.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+            ? "coral"
+            : profile.openAITTSVoice.trimmingCharacters(in: .whitespacesAndNewlines)
+        let instructions = profile.openAITTSInstructions.trimmingCharacters(in: .whitespacesAndNewlines)
+
+        struct RequestBody: Encodable {
+            let model: String
+            let voice: String
+            let input: String
+            let format: String
+            let speed: Double
+            let instructions: String?
+
+            enum CodingKeys: String, CodingKey {
+                case model
+                case voice
+                case input
+                case format = "response_format"
+                case speed
+                case instructions
+            }
+        }
+
+        var request = URLRequest(url: profile.openAITTSEndpoint)
+        request.httpMethod = "POST"
+        request.setValue("Bearer \(trimmedKey)", forHTTPHeaderField: "Authorization")
+        request.setValue("application/json", forHTTPHeaderField: "Content-Type")
+
+        do {
+            request.httpBody = try JSONEncoder().encode(
+                RequestBody(
+                    model: model,
+                    voice: voice,
+                    input: text,
+                    format: "wav",
+                    speed: min(max(profile.openAITTSSpeed, 0.25), 4.0),
+                    instructions: instructions.isEmpty ? nil : instructions
+                )
+            )
+        } catch {
+            updateStatus("Не удалось подготовить OpenAI TTS запрос: \(error.localizedDescription)")
+            return
+        }
+
+        setSpeaking(true)
+        updateStatus("OpenAI TTS синтезирует речь...")
+
+        URLSession.shared.dataTask(with: request) { [weak self] data, response, error in
+            if let error {
+                DispatchQueue.main.async {
+                    self?.setSpeaking(false)
+                    self?.cleanupAudioFile()
+                    self?.updateStatus(error.localizedDescription)
+                }
+                return
+            }
+
+            guard let data, let httpResponse = response as? HTTPURLResponse else {
+                DispatchQueue.main.async {
+                    self?.setSpeaking(false)
+                    self?.cleanupAudioFile()
+                    self?.updateStatus(OpenAITTSError.invalidResponse.localizedDescription)
+                }
+                return
+            }
+
+            guard (200..<300).contains(httpResponse.statusCode) else {
+                DispatchQueue.main.async {
+                    self?.setSpeaking(false)
+                    self?.cleanupAudioFile()
+                    self?.updateStatus(Self.extractOpenAIError(from: data))
+                }
+                return
+            }
+
+            do {
+                try data.write(to: outputURL)
+                DispatchQueue.main.async {
+                    self?.updateStatus("OpenAI TTS сгенерировал речь.")
+                    self?.playGeneratedAudio(from: outputURL)
+                }
+            } catch {
+                DispatchQueue.main.async {
+                    self?.setSpeaking(false)
+                    self?.cleanupAudioFile()
+                    self?.updateStatus(error.localizedDescription)
+                }
+            }
+        }.resume()
     }
 
     private func resolvePiperExecutablePath(from configuredPath: String) -> String {
@@ -309,8 +495,8 @@ final class SpeechCoordinator: NSObject, ObservableObject, @unchecked Sendable, 
 
     private func stopCurrentPlayback() {
         synthesizer.stopSpeaking(at: .immediate)
-        currentPiperProcess?.terminate()
-        currentPiperProcess = nil
+        currentSpeechProcess?.terminate()
+        currentSpeechProcess = nil
         audioPlayer?.stop()
         audioPlayer = nil
         cleanupAudioFile()
@@ -344,6 +530,68 @@ final class SpeechCoordinator: NSObject, ObservableObject, @unchecked Sendable, 
             return ["uk-UA", "ru-RU", "en-US"]
         case .english:
             return ["en-US", "en-GB", "ru-RU"]
+        }
+    }
+
+    private func xttsLanguageCode(for language: CompanionResponseLanguage) -> String {
+        switch language {
+        case .russian:
+            return "ru"
+        case .ukrainian:
+            return "uk"
+        case .english:
+            return "en"
+        }
+    }
+
+    private static func extractOpenAIError(from data: Data) -> String {
+        struct OpenAIErrorEnvelope: Decodable {
+            struct APIError: Decodable {
+                let message: String
+            }
+
+            let error: APIError
+        }
+
+        if let envelope = try? JSONDecoder().decode(OpenAIErrorEnvelope.self, from: data) {
+            return envelope.error.message
+        }
+
+        return String(data: data, encoding: .utf8)?.trimmingCharacters(in: .whitespacesAndNewlines)
+            ?? "OpenAI TTS вернул ошибку."
+    }
+
+    private func xttsPythonScript(outputPath: String, referencePath: String, text: String, languageCode: String) -> String {
+        let escapedOutput = outputPath.replacingOccurrences(of: "\\", with: "\\\\").replacingOccurrences(of: "\"", with: "\\\"")
+        let escapedReference = referencePath.replacingOccurrences(of: "\\", with: "\\\\").replacingOccurrences(of: "\"", with: "\\\"")
+        let escapedText = text.replacingOccurrences(of: "\\", with: "\\\\").replacingOccurrences(of: "\"", with: "\\\"")
+        let escapedLanguage = languageCode.replacingOccurrences(of: "\"", with: "\\\"")
+
+        return """
+from TTS.api import TTS
+
+tts = TTS("tts_models/multilingual/multi-dataset/xtts_v2", gpu=False)
+tts.tts_to_file(
+    text=\"\(escapedText)\",
+    file_path=\"\(escapedOutput)\",
+    speaker_wav=\"\(escapedReference)\",
+    language=\"\(escapedLanguage)\",
+)
+print("DONE")
+"""
+    }
+}
+
+enum OpenAITTSError: LocalizedError {
+    case invalidResponse
+    case serverMessage(String)
+
+    var errorDescription: String? {
+        switch self {
+        case .invalidResponse:
+            return "OpenAI TTS вернул неожиданный ответ."
+        case .serverMessage(let message):
+            return message
         }
     }
 }

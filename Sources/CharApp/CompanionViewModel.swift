@@ -28,7 +28,13 @@ final class CompanionViewModel: ObservableObject {
     @Published var piperExecutablePathText: String
     @Published var piperVoicesDirectoryText: String
     @Published var piperModelPathText: String
+    @Published var xttsPythonPathText: String
+    @Published var xttsReferencesDirectoryText: String
+    @Published var xttsReferencePathText: String
+    @Published var openAITTSEndpointText: String
+    @Published var openAITTSInstructionsText: String
     @Published var availablePiperVoices: [PiperVoiceOption] = []
+    @Published var availableXTTSReferences: [XTTSReferenceOption] = []
     @Published var isInstallingPiper = false
     @Published var ollamaEndpointText: String
     @Published var openAIEndpointText: String
@@ -54,7 +60,7 @@ final class CompanionViewModel: ObservableObject {
     private var dragResetTask: Task<Void, Never>?
 
     init() {
-        let loadedProfile = Self.withAutoDetectedPiperPaths(Self.loadProfile())
+        let loadedProfile = Self.withAutoDetectedTTSPaths(Self.loadProfile())
         profile = loadedProfile
         voiceRepliesEnabled = UserDefaults.standard.object(forKey: DefaultsKey.voiceRepliesEnabled) as? Bool ?? true
         openAIAPIKey = UserDefaults.standard.string(forKey: DefaultsKey.openAIAPIKey) ?? ""
@@ -80,6 +86,11 @@ final class CompanionViewModel: ObservableObject {
         piperExecutablePathText = loadedProfile.piperExecutablePath
         piperVoicesDirectoryText = loadedProfile.piperVoicesDirectory
         piperModelPathText = loadedProfile.piperModelPath
+        xttsPythonPathText = loadedProfile.xttsPythonPath
+        xttsReferencesDirectoryText = loadedProfile.xttsReferencesDirectory
+        xttsReferencePathText = loadedProfile.xttsReferencePath
+        openAITTSEndpointText = loadedProfile.openAITTSEndpoint.absoluteString
+        openAITTSInstructionsText = loadedProfile.openAITTSInstructions
         ollamaEndpointText = loadedProfile.ollamaEndpoint.absoluteString
         openAIEndpointText = loadedProfile.openAIEndpoint.absoluteString
         lmStudioEndpointText = loadedProfile.lmStudioEndpoint.absoluteString
@@ -91,7 +102,9 @@ final class CompanionViewModel: ObservableObject {
         ]
 
         autofillPiperPaths()
+        autofillXTTSPaths()
         refreshPiperVoices()
+        refreshXTTSReferences()
         bindPresence()
     }
 
@@ -172,6 +185,45 @@ final class CompanionViewModel: ObservableObject {
     func setTTSProvider(_ provider: CompanionTTSProvider) {
         guard profile.ttsProvider != provider else { return }
         profile.ttsProvider = provider
+        if provider == .openAI {
+            normalizeOpenAITTSSelection()
+        }
+        status = ""
+        persistProfile()
+    }
+
+    func setOpenAITTSModel(_ model: String) {
+        guard profile.openAITTSModel != model else { return }
+        profile.openAITTSModel = model
+        normalizeOpenAITTSSelection()
+        status = ""
+        persistProfile()
+    }
+
+    func setOpenAITTSVoice(_ voice: String) {
+        profile.openAITTSVoice = voice
+        status = ""
+        persistProfile()
+    }
+
+    func setOpenAITTSSpeed(_ speed: Double) {
+        profile.openAITTSSpeed = min(max(speed, 0.25), 4.0)
+        status = ""
+        persistProfile()
+    }
+
+    func setOpenAITTSInstructions(_ instructions: String) {
+        openAITTSInstructionsText = instructions
+        profile.openAITTSInstructions = instructions
+        status = ""
+        persistProfile()
+    }
+
+    func setOpenAITTSEndpoint(_ endpointString: String) {
+        openAITTSEndpointText = endpointString
+        let trimmed = endpointString.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard let url = URL(string: trimmed), !trimmed.isEmpty else { return }
+        profile.openAITTSEndpoint = url
         status = ""
         persistProfile()
     }
@@ -224,6 +276,42 @@ final class CompanionViewModel: ObservableObject {
         refreshPiperVoices()
         status = ""
         persistProfile()
+    }
+
+    func setXTTSPythonPath(_ path: String) {
+        xttsPythonPathText = path
+        profile.xttsPythonPath = path
+        status = ""
+        persistProfile()
+    }
+
+    func setXTTSReferencePath(_ path: String) {
+        xttsReferencePathText = path
+        profile.xttsReferencePath = path
+        status = ""
+        persistProfile()
+    }
+
+    func setXTTSReferencesDirectory(_ path: String) {
+        xttsReferencesDirectoryText = path
+        profile.xttsReferencesDirectory = path
+        refreshXTTSReferences()
+        status = ""
+        persistProfile()
+    }
+
+    func chooseXTTSReferencesDirectory() {
+        let panel = NSOpenPanel()
+        panel.canChooseFiles = false
+        panel.canChooseDirectories = true
+        panel.allowsMultipleSelection = false
+        panel.prompt = "Выбрать"
+        panel.message = "Выбери папку, где лежат XTTS reference clip'ы."
+
+        if panel.runModal() == .OK, let url = panel.url {
+            setXTTSReferencesDirectory(url.path)
+            autofillXTTSPaths()
+        }
     }
 
     func choosePiperVoicesDirectory() {
@@ -280,6 +368,39 @@ final class CompanionViewModel: ObservableObject {
         }
     }
 
+    func autofillXTTSPaths() {
+        let resolved = XTTSSupport.resolvePaths(
+            configuredPython: profile.xttsPythonPath,
+            configuredReference: profile.xttsReferencePath
+        )
+
+        if let pythonPath = resolved.pythonPath {
+            xttsPythonPathText = pythonPath
+            profile.xttsPythonPath = pythonPath
+        }
+
+        if let referencesDirectory = resolved.referencesDirectory, profile.xttsReferencesDirectory.isEmpty {
+            xttsReferencesDirectoryText = referencesDirectory
+            profile.xttsReferencesDirectory = referencesDirectory
+        }
+
+        if let referencePath = resolved.referencePath {
+            xttsReferencePathText = referencePath
+            profile.xttsReferencePath = referencePath
+        }
+
+        refreshXTTSReferences()
+        persistProfile()
+
+        if resolved.pythonPath != nil && resolved.referencePath != nil {
+            status = "XTTS найден и reference clip подставлен."
+        } else if resolved.pythonPath != nil {
+            status = "XTTS найден, но reference clip еще не выбран."
+        } else {
+            status = "Локальный XTTS пока не найден."
+        }
+    }
+
     func installPiperAutomatically() async {
         isInstallingPiper = true
         status = "Устанавливаю Piper локально..."
@@ -330,6 +451,65 @@ final class CompanionViewModel: ObservableObject {
         case (false, false):
             return "Piper пока не найден в системе или в локальной папке проекта."
         }
+    }
+
+    var xttsStatusSummary: String {
+        let resolved = XTTSSupport.resolvePaths(
+            configuredPython: profile.xttsPythonPath,
+            configuredReference: profile.xttsReferencePath
+        )
+
+        switch (resolved.pythonPath != nil, resolved.referencePath != nil) {
+        case (true, true):
+            return "XTTS найден: runtime и reference clip готовы."
+        case (true, false):
+            return "XTTS runtime найден, но reference clip еще не выбран."
+        case (false, true):
+            return "Reference clip есть, но XTTS runtime не найден."
+        case (false, false):
+            return "XTTS пока не найден в локальной папке проекта."
+        }
+    }
+
+    var availableOpenAITTSVoices: [String] {
+        OpenAITTSCatalog.voices(for: profile.openAITTSModel)
+    }
+
+    var openAITTSStatusSummary: String {
+        if openAIAPIKey.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+            return "Для OpenAI TTS нужен API key из секции LLM."
+        }
+
+        return "OpenAI TTS использует тот же API key, что и чат OpenAI."
+    }
+
+    func refreshXTTSReferences() {
+        let directory = profile.xttsReferencesDirectory.trimmingCharacters(in: .whitespacesAndNewlines)
+        if !directory.isEmpty {
+            availableXTTSReferences = XTTSSupport.discoverReferences(in: directory)
+        } else if let autoDirectory = XTTSSupport.resolveReferencesDirectory() {
+            availableXTTSReferences = XTTSSupport.discoverReferences(in: autoDirectory)
+            if profile.xttsReferencesDirectory.isEmpty {
+                xttsReferencesDirectoryText = autoDirectory
+                profile.xttsReferencesDirectory = autoDirectory
+            }
+        } else {
+            availableXTTSReferences = []
+        }
+
+        if !availableXTTSReferences.contains(where: { $0.filePath == profile.xttsReferencePath }),
+           let first = availableXTTSReferences.first {
+            profile.xttsReferencePath = first.filePath
+            xttsReferencePathText = first.filePath
+            persistProfile()
+        }
+    }
+
+    func selectXTTSReference(_ filePath: String) {
+        xttsReferencePathText = filePath
+        profile.xttsReferencePath = filePath
+        status = ""
+        persistProfile()
     }
 
     func refreshPiperVoices() {
@@ -428,7 +608,7 @@ final class CompanionViewModel: ObservableObject {
 
     func previewVoice() {
         status = ""
-        speech.previewVoice(profile: profile)
+        speech.previewVoice(profile: profile, openAIAPIKey: openAIAPIKey)
     }
 
     func generateStartupGreetingIfNeeded() async {
@@ -465,7 +645,7 @@ final class CompanionViewModel: ObservableObject {
             messages.append(ChatMessage(role: .assistant, text: reply))
             setEmotion(for: reply)
             if voiceRepliesEnabled {
-                speech.speak(reply, profile: profile)
+                speech.speak(reply, profile: profile, openAIAPIKey: openAIAPIKey)
             } else {
                 presenceState = .speaking
                 Task { [weak self] in
@@ -617,7 +797,7 @@ final class CompanionViewModel: ObservableObject {
         return profile
     }
 
-    private static func withAutoDetectedPiperPaths(_ profile: CompanionProfile) -> CompanionProfile {
+    private static func withAutoDetectedTTSPaths(_ profile: CompanionProfile) -> CompanionProfile {
         var updated = profile
         let fileManager = FileManager.default
         let bundledPiperExecutable = URL(fileURLWithPath: FileManager.default.currentDirectoryPath)
@@ -637,7 +817,47 @@ final class CompanionViewModel: ObservableObject {
             updated.piperModelPath = bundledPiperModel
         }
 
+        let bundledXTTSPython = URL(fileURLWithPath: FileManager.default.currentDirectoryPath)
+            .appendingPathComponent(".venv-xtts/bin/python")
+            .path
+        let bundledXTTSReference = AppEnvironment.assetsRootURL
+            .appendingPathComponent("TTS/Reference/xtts_reference.wav")
+            .path
+        let bundledXTTSReferencesDirectory = AppEnvironment.assetsRootURL
+            .appendingPathComponent("TTS/Reference")
+            .path
+
+        if updated.xttsPythonPath.isEmpty,
+           fileManager.isExecutableFile(atPath: bundledXTTSPython) {
+            updated.xttsPythonPath = bundledXTTSPython
+        }
+
+        if updated.xttsReferencesDirectory.isEmpty,
+           fileManager.fileExists(atPath: bundledXTTSReferencesDirectory) {
+            updated.xttsReferencesDirectory = bundledXTTSReferencesDirectory
+        }
+
+        if updated.xttsReferencePath.isEmpty,
+           fileManager.fileExists(atPath: bundledXTTSReference) {
+            updated.xttsReferencePath = bundledXTTSReference
+        }
+
+        if updated.openAITTSInstructions.isEmpty {
+            updated.openAITTSInstructions = "Speak in a soft, friendly, conversational tone with a light feminine feel. Keep the delivery warm and natural, not robotic."
+        }
+
+        if updated.openAITTSEndpoint.absoluteString.isEmpty {
+            updated.openAITTSEndpoint = URL(string: "https://api.openai.com/v1/audio/speech")!
+        }
+
         return updated
+    }
+
+    private func normalizeOpenAITTSSelection() {
+        let availableVoices = OpenAITTSCatalog.voices(for: profile.openAITTSModel)
+        if !availableVoices.contains(profile.openAITTSVoice), let first = availableVoices.first {
+            profile.openAITTSVoice = first
+        }
     }
 
     private func updatePresence() {

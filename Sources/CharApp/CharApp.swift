@@ -89,7 +89,7 @@ struct CompanionSettingsView: View {
                     Text("Используется встроенный голос macOS. Язык берется из настройки ответа.")
                         .font(.footnote)
                         .foregroundStyle(.secondary)
-                } else {
+                } else if viewModel.profile.ttsProvider == .piper {
                     TextField(
                         "Путь к Piper",
                         text: Binding(
@@ -149,6 +149,140 @@ struct CompanionSettingsView: View {
                         }
                         .disabled(viewModel.isInstallingPiper)
                     }
+                } else if viewModel.profile.ttsProvider == .xtts {
+                    TextField(
+                        "Путь к XTTS Python",
+                        text: Binding(
+                            get: { viewModel.xttsPythonPathText },
+                            set: { viewModel.setXTTSPythonPath($0) }
+                        )
+                    )
+                    .textFieldStyle(.roundedBorder)
+
+                    HStack {
+                        Text(viewModel.xttsReferencesDirectoryText.isEmpty ? "Папка с референсами не выбрана" : viewModel.xttsReferencesDirectoryText)
+                            .lineLimit(2)
+                            .font(.footnote)
+                            .foregroundStyle(.secondary)
+
+                        Spacer(minLength: 12)
+
+                        Button("Выбрать папку") {
+                            viewModel.chooseXTTSReferencesDirectory()
+                        }
+                    }
+
+                    if !viewModel.availableXTTSReferences.isEmpty {
+                        Picker(
+                            "Найденные референсы",
+                            selection: Binding(
+                                get: { viewModel.profile.xttsReferencePath },
+                                set: { viewModel.selectXTTSReference($0) }
+                            )
+                        ) {
+                            ForEach(viewModel.availableXTTSReferences) { reference in
+                                Text(reference.displayName).tag(reference.filePath)
+                            }
+                        }
+                        .pickerStyle(.menu)
+                    }
+
+                    Text("XTTS использует reference clip для клонирования голоса. Лучше всего работает 6-10 секунд чистой речи.")
+                        .font(.footnote)
+                        .foregroundStyle(.secondary)
+
+                    Text(viewModel.xttsStatusSummary)
+                        .font(.footnote)
+                        .foregroundStyle(.secondary)
+
+                    VStack(alignment: .leading, spacing: 8) {
+                        Button("Подставить локальный XTTS") {
+                            viewModel.autofillXTTSPaths()
+                        }
+
+                        Button("Обновить список референсов") {
+                            viewModel.refreshXTTSReferences()
+                        }
+                    }
+                } else {
+                    Picker(
+                        "Модель OpenAI TTS",
+                        selection: Binding(
+                            get: { viewModel.profile.openAITTSModel },
+                            set: { viewModel.setOpenAITTSModel($0) }
+                        )
+                    ) {
+                        ForEach(OpenAITTSCatalog.supportedModels, id: \.self) { model in
+                            Text(model).tag(model)
+                        }
+                    }
+                    .pickerStyle(.menu)
+
+                    Picker(
+                        "Голос",
+                        selection: Binding(
+                            get: { viewModel.profile.openAITTSVoice },
+                            set: { viewModel.setOpenAITTSVoice($0) }
+                        )
+                    ) {
+                        ForEach(viewModel.availableOpenAITTSVoices, id: \.self) { voice in
+                            Text(voice).tag(voice)
+                        }
+                    }
+                    .pickerStyle(.menu)
+
+                    VStack(alignment: .leading, spacing: 6) {
+                        HStack {
+                            Text("Скорость")
+                            Spacer()
+                            Text(String(format: "%.2f", viewModel.profile.openAITTSSpeed))
+                                .foregroundStyle(.secondary)
+                        }
+
+                        Slider(
+                            value: Binding(
+                                get: { viewModel.profile.openAITTSSpeed },
+                                set: { viewModel.setOpenAITTSSpeed($0) }
+                            ),
+                            in: 0.6...1.2,
+                            step: 0.02
+                        )
+                    }
+
+                    TextField(
+                        "Endpoint OpenAI TTS",
+                        text: Binding(
+                            get: { viewModel.openAITTSEndpointText },
+                            set: { viewModel.setOpenAITTSEndpoint($0) }
+                        )
+                    )
+                    .textFieldStyle(.roundedBorder)
+
+                    VStack(alignment: .leading, spacing: 6) {
+                        Text("Инструкции для голоса")
+                            .font(.footnote)
+                            .foregroundStyle(.secondary)
+
+                        TextEditor(
+                            text: Binding(
+                                get: { viewModel.openAITTSInstructionsText },
+                                set: { viewModel.setOpenAITTSInstructions($0) }
+                            )
+                        )
+                        .frame(minHeight: 96)
+                        .overlay(
+                            RoundedRectangle(cornerRadius: 8)
+                                .stroke(Color.black.opacity(0.12), lineWidth: 1)
+                        )
+                    }
+
+                    Text("Для аниме-вайба обычно лучше начинать с более легких женских голосов вроде coral или shimmer, со скоростью около 0.9-1.0 и мягкими friendly-инструкциями.")
+                        .font(.footnote)
+                        .foregroundStyle(.secondary)
+
+                    Text(viewModel.openAITTSStatusSummary)
+                        .font(.footnote)
+                        .foregroundStyle(.secondary)
                 }
 
                 Button("Пробный голос") {

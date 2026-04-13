@@ -4,6 +4,8 @@
 .vscode/
 Live2D/build/
 dist/
+.venv-piper/
+.venv-xtts/
 
 *.zip
 char_debug*.png

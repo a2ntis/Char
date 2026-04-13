@@ -23,6 +23,8 @@ enum CompanionLLMProvider: String, CaseIterable, Codable, Hashable, Identifiable
 enum CompanionTTSProvider: String, CaseIterable, Codable, Hashable, Identifiable {
     case system
     case piper
+    case xtts
+    case openAI
 
     var id: String { rawValue }
 
@@ -32,7 +34,54 @@ enum CompanionTTSProvider: String, CaseIterable, Codable, Hashable, Identifiable
             return "Системный голос"
         case .piper:
             return "Piper (локально)"
+        case .xtts:
+            return "XTTS v2 (локально)"
+        case .openAI:
+            return "OpenAI TTS"
         }
+    }
+}
+
+enum OpenAITTSCatalog {
+    static let supportedModels: [String] = [
+        "gpt-4o-mini-tts",
+        "tts-1-hd",
+        "tts-1",
+    ]
+
+    static let allVoices: [String] = [
+        "alloy",
+        "ash",
+        "ballad",
+        "cedar",
+        "coral",
+        "echo",
+        "fable",
+        "marin",
+        "nova",
+        "onyx",
+        "sage",
+        "shimmer",
+        "verse",
+    ]
+
+    static let legacyVoices: Set<String> = [
+        "alloy",
+        "ash",
+        "coral",
+        "echo",
+        "fable",
+        "nova",
+        "onyx",
+        "sage",
+        "shimmer",
+    ]
+
+    static func voices(for model: String) -> [String] {
+        if model == "tts-1" || model == "tts-1-hd" {
+            return allVoices.filter { legacyVoices.contains($0) }
+        }
+        return allVoices
     }
 }
 
@@ -92,6 +141,14 @@ struct CompanionProfile: Codable, Hashable {
     var piperExecutablePath: String = "piper"
     var piperVoicesDirectory: String = ""
     var piperModelPath: String = ""
+    var xttsPythonPath: String = ""
+    var xttsReferencesDirectory: String = ""
+    var xttsReferencePath: String = ""
+    var openAITTSModel: String = "gpt-4o-mini-tts"
+    var openAITTSVoice: String = "coral"
+    var openAITTSSpeed: Double = 0.96
+    var openAITTSInstructions: String = "Speak in a soft, friendly, conversational tone with a light feminine feel. Keep the delivery warm and natural, not robotic."
+    var openAITTSEndpoint: URL = URL(string: "https://api.openai.com/v1/audio/speech")!
     var provider: CompanionLLMProvider = .ollama
     var ollamaModel: String = "qwen3:14b"
     var ollamaEndpoint: URL = URL(string: "http://127.0.0.1:11434/api/chat")!
@@ -156,6 +213,14 @@ struct CompanionProfile: Codable, Hashable {
         case piperExecutablePath
         case piperVoicesDirectory
         case piperModelPath
+        case xttsPythonPath
+        case xttsReferencesDirectory
+        case xttsReferencePath
+        case openAITTSModel
+        case openAITTSVoice
+        case openAITTSSpeed
+        case openAITTSInstructions
+        case openAITTSEndpoint
         case provider
         case ollamaModel
         case ollamaEndpoint
@@ -181,6 +246,14 @@ struct CompanionProfile: Codable, Hashable {
         piperExecutablePath = try container.decodeIfPresent(String.self, forKey: .piperExecutablePath) ?? "piper"
         piperVoicesDirectory = try container.decodeIfPresent(String.self, forKey: .piperVoicesDirectory) ?? ""
         piperModelPath = try container.decodeIfPresent(String.self, forKey: .piperModelPath) ?? ""
+        xttsPythonPath = try container.decodeIfPresent(String.self, forKey: .xttsPythonPath) ?? ""
+        xttsReferencesDirectory = try container.decodeIfPresent(String.self, forKey: .xttsReferencesDirectory) ?? ""
+        xttsReferencePath = try container.decodeIfPresent(String.self, forKey: .xttsReferencePath) ?? ""
+        openAITTSModel = try container.decodeIfPresent(String.self, forKey: .openAITTSModel) ?? "gpt-4o-mini-tts"
+        openAITTSVoice = try container.decodeIfPresent(String.self, forKey: .openAITTSVoice) ?? "coral"
+        openAITTSSpeed = try container.decodeIfPresent(Double.self, forKey: .openAITTSSpeed) ?? 0.96
+        openAITTSInstructions = try container.decodeIfPresent(String.self, forKey: .openAITTSInstructions) ?? "Speak in a soft, friendly, conversational tone with a light feminine feel. Keep the delivery warm and natural, not robotic."
+        openAITTSEndpoint = try container.decodeIfPresent(URL.self, forKey: .openAITTSEndpoint) ?? URL(string: "https://api.openai.com/v1/audio/speech")!
         provider = try container.decodeIfPresent(CompanionLLMProvider.self, forKey: .provider) ?? .ollama
         ollamaModel = try container.decodeIfPresent(String.self, forKey: .ollamaModel) ?? "qwen3:14b"
         ollamaEndpoint = try container.decodeIfPresent(URL.self, forKey: .ollamaEndpoint) ?? URL(string: "http://127.0.0.1:11434/api/chat")!
@@ -195,6 +268,12 @@ struct PiperVoiceOption: Identifiable, Hashable {
     let id: String
     let displayName: String
     let modelPath: String
+}
+
+struct XTTSReferenceOption: Identifiable, Hashable {
+    let id: String
+    let displayName: String
+    let filePath: String
 }
 
 struct CompanionModelOption: Identifiable, Hashable {
