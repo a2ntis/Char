@@ -7,11 +7,15 @@ let cubismCoreLib = "\(packageRoot)/ThirdParty/CubismSdkForNative-5-r.5/Core/lib
 
 let package = Package(
     name: "Char",
+    defaultLocalization: nil,
     platforms: [
-        .macOS(.v14)
+        .macOS(.v15)
     ],
     products: [
         .executable(name: "Char", targets: ["CharApp"])
+    ],
+    dependencies: [
+        .package(name: "VRMKit", path: "ThirdParty/VRMKit")
     ],
     targets: [
         .target(
@@ -60,7 +64,10 @@ let package = Package(
         ),
         .executableTarget(
             name: "CharApp",
-            dependencies: ["Live2DBridge"],
+            dependencies: [
+                "Live2DBridge",
+                .product(name: "VRMRealityKit", package: "VRMKit")
+            ],
             path: "Sources/CharApp"
         )
     ]

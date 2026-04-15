@@ -394,6 +394,15 @@ actor CompanionChatClient {
         try await openAI.listModelsWithoutAuthorization(endpoint: endpoint)
     }
 
+    func listGoogleTTSVoices(endpoint: URL, apiKey: String) async throws -> [GoogleTTSVoiceOption] {
+        _ = endpoint
+        let trimmedKey = apiKey.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !trimmedKey.isEmpty else {
+            throw CompanionError.missingAPIKey("Gemini TTS")
+        }
+        return GeminiTTSCatalog.voices
+    }
+
     func validate(profile: CompanionProfile, openAIKey: String) async throws -> String {
         switch profile.provider {
         case .ollama:

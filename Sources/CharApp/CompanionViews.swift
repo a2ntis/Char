@@ -1,7 +1,9 @@
 import AppKit
 import Combine
 import Live2DBridge
+import RealityKit
 import SwiftUI
+import VRMRealityKit
 
 struct AvatarPanelView: View {
     @ObservedObject var viewModel: CompanionViewModel
@@ -22,13 +24,7 @@ struct AvatarPanelView: View {
                     .transition(.opacity)
             }
 
-            Live2DAvatarRepresentable(
-                assetRootPath: viewModel.selectedModel.assetRootPath,
-                passiveIdle: viewModel.selectedModel.preset.passiveIdle,
-                onTap: onToggleChat
-            ) { aspectRatio in
-                viewModel.updateAvatarAspectRatio(aspectRatio)
-            }
+            avatarView
                 .scaleEffect(avatarScale)
                 .frame(
                     width: viewModel.avatarLayout.viewportSize.width,
@@ -45,6 +41,33 @@ struct AvatarPanelView: View {
         .onAppear {
             runIdleAnimation()
             runBlinkLoop()
+        }
+    }
+
+    @ViewBuilder
+    private var avatarView: some View {
+        switch viewModel.selectedModel.runtime {
+        case .live2d:
+            Live2DAvatarRepresentable(
+                assetRootPath: viewModel.selectedModel.assetRootPath,
+                passiveIdle: viewModel.selectedModel.preset.passiveIdle,
+                onTap: onToggleChat
+            ) { aspectRatio in
+                viewModel.updateAvatarAspectRatio(aspectRatio)
+            }
+        case .vrm:
+            VRMAvatarRepresentable(
+                filePath: viewModel.selectedModel.entryPath,
+                presenceState: viewModel.presenceState,
+                onTap: onToggleChat
+            ) { aspectRatio in
+                viewModel.updateAvatarAspectRatio(aspectRatio)
+            }
+        case .vroidProject:
+            UnsupportedAvatarView(
+                title: viewModel.selectedModel.displayName,
+                detail: "Это файл проекта VRoid Studio. Экспортируй его как .vrm, и я смогу встроить его как полноценный аватар."
+            )
         }
     }
 
@@ -633,56 +656,738 @@ final class Live2DTappableContainer: NSView {
     }
 }
 
+struct VRMAvatarRepresentable: NSViewRepresentable {
+    let filePath: String
+    let presenceState: CompanionPresenceState
+    let onTap: () -> Void
+    let onAspectRatioChange: (CGFloat) -> Void
+
+    func makeNSView(context: Context) -> CompanionVRMRealityView {
+        let view = CompanionVRMRealityView(frame: .zero)
+        view.filePath = filePath
+        view.tapHandler = onTap
+        view.scrollHandler = { deltaY in
+            context.coordinator.onScroll(deltaY)
+        }
+        view.aspectRatioHandler = onAspectRatioChange
+        view.presenceState = presenceState
+        view.reloadModel()
+        return view
+    }
+
+    func updateNSView(_ nsView: CompanionVRMRealityView, context: Context) {
+        nsView.tapHandler = onTap
+        nsView.scrollHandler = { deltaY in
+            context.coordinator.onScroll(deltaY)
+        }
+        nsView.aspectRatioHandler = onAspectRatioChange
+        nsView.presenceState = presenceState
+        if nsView.filePath != filePath {
+            nsView.filePath = filePath
+            nsView.reloadModel()
+        }
+    }
+
+    func makeCoordinator() -> Coordinator {
+        Coordinator()
+    }
+
+    final class Coordinator {
+        var onScroll: (CGFloat) -> Void = { _ in }
+    }
+}
+
+@available(macOS 15.0, *)
+@MainActor
+final class CompanionVRMRealityView: ARView {
+    var filePath: String = ""
+    var presenceState: CompanionPresenceState = .idle
+    var speechLevel: CGFloat = 0
+    var draggingActive: Bool = false
+    var tapHandler: (() -> Void)?
+    var scrollHandler: ((CGFloat) -> Void)?
+    var aspectRatioHandler: ((CGFloat) -> Void)?
+
+    private var mouseDownPoint: NSPoint = .zero
+    private var draggedSinceMouseDown = false
+    private let rootAnchor = AnchorEntity(world: .zero)
+    private let cameraAnchor = AnchorEntity(world: .zero)
+    private let cameraEntity = PerspectiveCamera()
+    private var vrmEntity: VRMEntity?
+    private var vrmaPlayer: VRMAPlayer?
+    private var posePlayer: VRoidPosePlayer?
+    private var updateSubscription: Cancellable?
+    private var orbitTarget = SIMD3<Float>(0, 0.8, 0)
+    private var orbitDistance: Float = 1.45
+    private var blinkTimer: Timer?
+    private var activeExpression: CompanionVRMExpressionPreset = .neutral
+    private var primaryExpressionTargets: [BlendShapeKey: CGFloat] = [:]
+    private var primaryExpressionCurrent: [BlendShapeKey: CGFloat] = [:]
+    private var blinkKeys: [BlendShapeKey] = [
+        .preset(.blink),
+        .preset(.blinkL),
+        .preset(.blinkR),
+        .custom("Blink"),
+        .custom("blink"),
+        .custom("Closed"),
+        .custom("closed"),
+    ]
+    private var blinkTarget: CGFloat = 0
+    private var blinkCurrent: CGFloat = 0
+    private var mouthTime: TimeInterval = 0
+    private var mouthCurrent: CGFloat = 0
+    private var mouthKeys: [BlendShapeKey] = [
+        .preset(.a),
+        .custom("A"),
+        .custom("a"),
+        .custom("Aa"),
+        .custom("aa"),
+    ]
+    private var motionTime: TimeInterval = 0
+    private var headEntity: Entity?
+    private var neckEntity: Entity?
+    private var chestEntity: Entity?
+    private var spineEntity: Entity?
+    private var headBaseRotation = simd_quatf(angle: 0, axis: SIMD3<Float>(0, 1, 0))
+    private var neckBaseRotation = simd_quatf(angle: 0, axis: SIMD3<Float>(0, 1, 0))
+    private var chestBaseRotation = simd_quatf(angle: 0, axis: SIMD3<Float>(0, 1, 0))
+    private var spineBaseRotation = simd_quatf(angle: 0, axis: SIMD3<Float>(0, 1, 0))
+    private var rootBasePosition = SIMD3<Float>(repeating: 0)
+    private var rootBaseRotation = simd_quatf(angle: 0, axis: SIMD3<Float>(0, 1, 0))
+    private var vrmConvention: VRMCoordinateConvention = .v0
+    private var boneRestTransforms: [Humanoid.Bones: Transform] = [:]
+    private var glTFChestEntity: Entity?
+    private var glTFChestRestTransform: Transform?
+    private var lookYawCurrent: Float = 0
+    private var lookPitchCurrent: Float = 0
+    private var dragYawCurrent: Float = 0
+    private var dragRollCurrent: Float = 0
+    private var dragPitchCurrent: Float = 0
+    private var dragYawTarget: Float = 0
+    private var dragRollTarget: Float = 0
+    private var dragPitchTarget: Float = 0
+
+    required init(frame frameRect: NSRect) {
+        super.init(frame: frameRect)
+        commonInit()
+    }
+
+    required init?(coder: NSCoder) {
+        super.init(coder: coder)
+        commonInit()
+    }
+
+    private func commonInit() {
+        wantsLayer = true
+        layer?.backgroundColor = NSColor.clear.cgColor
+        environment.background = .color(.clear)
+
+        scene.addAnchor(rootAnchor)
+        scene.addAnchor(cameraAnchor)
+        cameraAnchor.addChild(cameraEntity)
+        updateCameraTransform()
+        scheduleNextBlink()
+    }
+
+    override func acceptsFirstMouse(for event: NSEvent?) -> Bool {
+        true
+    }
+
+    override func layout() {
+        super.layout()
+        if let entity = vrmEntity?.entity {
+            updateOrbitTarget(for: entity)
+        }
+    }
+
+    func reloadModel() {
+        guard !filePath.isEmpty else { return }
+
+        do {
+            if let vrmEntity {
+                vrmEntity.entity.removeFromParent()
+                self.vrmEntity = nil
+            }
+            vrmaPlayer = nil
+            updateSubscription?.cancel()
+            updateSubscription = nil
+
+            let loader = try VRMEntityLoader(withURL: URL(fileURLWithPath: filePath))
+            let vrmEntity = try loader.loadEntity()
+            switch vrmEntity.vrm {
+            case .v0: vrmConvention = .v0
+            case .v1: vrmConvention = .v1
+            }
+            applyDefaultPoseTransform(to: vrmEntity)
+            rootAnchor.addChild(vrmEntity.entity)
+            self.vrmEntity = vrmEntity
+            captureRigReferences(for: vrmEntity)
+
+            normalizeScale(for: vrmEntity.entity)
+            updateOrbitTarget(for: vrmEntity.entity)
+            applyExpression(.neutral)
+
+            updateSubscription = scene.subscribe(to: SceneEvents.Update.self) { [weak self] event in
+                Task { @MainActor in
+                    guard let self, let vrmEntity = self.vrmEntity else { return }
+                    vrmEntity.update(at: event.deltaTime)
+                    self.updateExpressionAnimation(deltaTime: event.deltaTime)
+                    self.updateMouthAnimation(deltaTime: event.deltaTime)
+                    self.updateBodyAnimation(deltaTime: event.deltaTime)
+                    if let player = self.vrmaPlayer {
+                        let stillPlaying = player.update(deltaTime: event.deltaTime)
+                        if !stillPlaying {
+                            self.vrmaPlayer = nil
+                        }
+                    }
+                    self.posePlayer?.update(deltaTime: event.deltaTime)
+                }
+            }
+        } catch {
+            aspectRatioHandler?(0.62)
+            Swift.print("Failed to load VRM at \(filePath): \(String(reflecting: error))")
+        }
+    }
+
+    func playVRMA(filePath: String) {
+        guard let vrmEntity else { return }
+        posePlayer = nil
+        do {
+            vrmaPlayer = try VRMAPlayer(
+                filePath: filePath,
+                vrmEntity: vrmEntity,
+                restTransforms: boneRestTransforms,
+                chestEntity: glTFChestEntity,
+                chestRestTransform: glTFChestRestTransform,
+                convention: vrmConvention
+            )
+        } catch {
+            Swift.print("Failed to play VRMA at \(filePath): \(String(reflecting: error))")
+            vrmaPlayer = nil
+        }
+    }
+
+    func applyPose(filePath: String) {
+        guard let vrmEntity else { return }
+        vrmaPlayer = nil
+        do {
+            posePlayer = try VRoidPosePlayer(
+                filePath: filePath,
+                vrmEntity: vrmEntity,
+                restTransforms: boneRestTransforms,
+                chestEntity: glTFChestEntity,
+                chestRestTransform: glTFChestRestTransform,
+                convention: vrmConvention
+            )
+        } catch {
+            Swift.print("Failed to apply pose at \(filePath): \(String(reflecting: error))")
+            posePlayer = nil
+        }
+    }
+
+    func clearPose() {
+        posePlayer = nil
+    }
+
+    func applyExpression(_ expression: CompanionVRMExpressionPreset) {
+        activeExpression = expression
+        var nextTargets: [BlendShapeKey: CGFloat] = [:]
+        for key in primaryExpressionKeys {
+            nextTargets[key] = 0
+        }
+        for key in expressionCandidates(for: expression) {
+            nextTargets[key] = 1
+        }
+        primaryExpressionTargets = nextTargets
+    }
+
+    func applyEmotionPreview(_ emotion: CompanionEmotionState?) {
+        let expression: CompanionVRMExpressionPreset
+        switch emotion {
+        case .happy, .excited:
+            expression = .happy
+        case .angry:
+            expression = .angry
+        case .shy, .thinking:
+            expression = .smiling
+        case .sleepy:
+            expression = .sad
+        case .none, .neutral:
+            expression = .neutral
+        }
+        applyExpression(expression)
+    }
+
+    private func applyDefaultPoseTransform(to vrmEntity: VRMEntity) {
+        vrmEntity.entity.position = .zero
+        switch vrmEntity.vrm {
+        case .v0:
+            vrmEntity.entity.orientation = simd_quatf(angle: .pi, axis: SIMD3<Float>(0, 1, 0))
+        case .v1:
+            vrmEntity.entity.orientation = simd_quatf(angle: 0, axis: SIMD3<Float>(0, 1, 0))
+        }
+    }
+
+    private func captureRigReferences(for vrmEntity: VRMEntity) {
+        headEntity = vrmEntity.humanoid.node(for: .head)
+        neckEntity = vrmEntity.humanoid.node(for: .neck)
+        chestEntity = vrmEntity.humanoid.node(for: .upperChest)
+        spineEntity = vrmEntity.humanoid.node(for: .spine)
+
+        headBaseRotation = headEntity?.transform.rotation ?? simd_quatf(angle: 0, axis: SIMD3<Float>(0, 1, 0))
+        neckBaseRotation = neckEntity?.transform.rotation ?? simd_quatf(angle: 0, axis: SIMD3<Float>(0, 1, 0))
+        chestBaseRotation = chestEntity?.transform.rotation ?? simd_quatf(angle: 0, axis: SIMD3<Float>(0, 1, 0))
+        spineBaseRotation = spineEntity?.transform.rotation ?? simd_quatf(angle: 0, axis: SIMD3<Float>(0, 1, 0))
+        rootBasePosition = vrmEntity.entity.transform.translation
+        rootBaseRotation = vrmEntity.entity.transform.rotation
+
+        lookYawCurrent = 0
+        lookPitchCurrent = 0
+        dragYawCurrent = 0
+        dragRollCurrent = 0
+        dragPitchCurrent = 0
+        dragYawTarget = 0
+        dragRollTarget = 0
+        dragPitchTarget = 0
+
+        captureBoneRestTransforms(for: vrmEntity)
+    }
+
+    private static let allTrackedBones: [Humanoid.Bones] = [
+        .hips, .spine, .upperChest, .neck, .head, .jaw, .leftEye, .rightEye,
+        .leftShoulder, .rightShoulder,
+        .leftUpperArm, .rightUpperArm, .leftLowerArm, .rightLowerArm,
+        .leftHand, .rightHand,
+        .leftUpperLeg, .rightUpperLeg, .leftLowerLeg, .rightLowerLeg,
+        .leftFoot, .rightFoot, .leftToes, .rightToes,
+        .leftThumbProximal, .leftThumbIntermediate, .leftThumbDistal,
+        .leftIndexProximal, .leftIndexIntermediate, .leftIndexDistal,
+        .leftMiddleProximal, .leftMiddleIntermediate, .leftMiddleDistal,
+        .leftRingProximal, .leftRingIntermediate, .leftRingDistal,
+        .leftLittleProximal, .leftLittleIntermediate, .leftLittleDistal,
+        .rightThumbProximal, .rightThumbIntermediate, .rightThumbDistal,
+        .rightIndexProximal, .rightIndexIntermediate, .rightIndexDistal,
+        .rightMiddleProximal, .rightMiddleIntermediate, .rightMiddleDistal,
+        .rightRingProximal, .rightRingIntermediate, .rightRingDistal,
+        .rightLittleProximal, .rightLittleIntermediate, .rightLittleDistal,
+    ]
+
+    private func captureBoneRestTransforms(for vrmEntity: VRMEntity) {
+        boneRestTransforms.removeAll()
+        for bone in Self.allTrackedBones {
+            if let entity = vrmEntity.humanoid.node(for: bone) {
+                boneRestTransforms[bone] = entity.transform
+            }
+        }
+
+        glTFChestEntity = nil
+        glTFChestRestTransform = nil
+        if let spineNode = vrmEntity.humanoid.node(for: .spine),
+           let upperChestNode = vrmEntity.humanoid.node(for: .upperChest) {
+            for child in spineNode.children {
+                if child === upperChestNode {
+                    break
+                }
+                if isAncestorOf(target: upperChestNode, in: child) {
+                    glTFChestEntity = child
+                    glTFChestRestTransform = child.transform
+                    break
+                }
+            }
+        }
+    }
+
+    private func isAncestorOf(target: Entity, in entity: Entity) -> Bool {
+        if entity === target { return true }
+        for child in entity.children {
+            if isAncestorOf(target: target, in: child) { return true }
+        }
+        return false
+    }
+
+    private func normalizeScale(for entity: Entity) {
+        let bounds = entity.visualBounds(relativeTo: nil)
+        let height = bounds.max.y - bounds.min.y
+        guard height > 0.001 else { return }
+        let targetHeight: Float = 2.0
+        let scale = targetHeight / height
+        entity.transform.scale = SIMD3<Float>(repeating: scale)
+    }
+
+    private func updateOrbitTarget(for entity: Entity) {
+        let bounds = entity.visualBounds(relativeTo: nil)
+        let center = (bounds.min + bounds.max) * 0.5
+        let extents = bounds.max - bounds.min
+        orbitTarget = center
+
+        let viewportAspect = max(Float(self.bounds.width / max(self.bounds.height, 1)), 0.1)
+        let verticalFOV: Float = .pi / 3
+        let horizontalFOV = 2 * atan(tan(verticalFOV / 2) * viewportAspect)
+        let fitHeightDistance = (extents.y * 0.5) / tan(verticalFOV / 2)
+        let fitWidthDistance = (extents.x * 0.5) / tan(horizontalFOV / 2)
+        let depthPadding = max(extents.z * 0.25, 0.02)
+        orbitDistance = max(fitHeightDistance, fitWidthDistance) + depthPadding
+        updateCameraTransform()
+
+        let height = CGFloat(extents.y)
+        let width = CGFloat(extents.x)
+        guard height > 0.001 else {
+            aspectRatioHandler?(0.62)
+            return
+        }
+        let ratio = max(min(width / height, 1.4), 0.5)
+        aspectRatioHandler?(ratio)
+    }
+
+    private func updateCameraTransform() {
+        let position = orbitTarget + SIMD3<Float>(0, 0, orbitDistance)
+        cameraEntity.look(at: orbitTarget, from: position, relativeTo: nil)
+    }
+
+    private func scheduleNextBlink() {
+        blinkTimer?.invalidate()
+        let interval = TimeInterval.random(in: 2.4...5.2)
+        blinkTimer = Timer.scheduledTimer(withTimeInterval: interval, repeats: false) { [weak self] _ in
+            Task { @MainActor [weak self] in
+                guard let self else { return }
+                self.performBlink()
+                self.scheduleNextBlink()
+            }
+        }
+    }
+
+    private func performBlink() {
+        guard vrmEntity != nil else { return }
+        blinkTarget = 1.0
+
+        DispatchQueue.main.asyncAfter(deadline: .now() + 0.11) { [weak self] in
+            guard let self else { return }
+            self.blinkTarget = 0.0
+        }
+    }
+
+    private var primaryExpressionKeys: [BlendShapeKey] {
+        [
+            .preset(.neutral),
+            .preset(.joy),
+            .preset(.angry),
+            .preset(.sorrow),
+            .preset(.fun),
+            .custom("Neutral"),
+            .custom("neutral"),
+            .custom("Smiling"),
+            .custom("Smile"),
+            .custom("smile"),
+            .custom("Sad"),
+            .custom("sad"),
+            .custom("Angry"),
+            .custom("angry"),
+            .custom("Happy"),
+            .custom("happy"),
+            .custom("Joy"),
+            .custom("joy"),
+            .custom("Surprised"),
+            .custom("surprised"),
+            .custom("Surprise"),
+            .custom("surprise"),
+        ]
+    }
+
+    private func expressionCandidates(for expression: CompanionVRMExpressionPreset) -> [BlendShapeKey] {
+        switch expression {
+        case .neutral:
+            return [.preset(.neutral), .custom("Neutral"), .custom("neutral")]
+        case .smiling:
+            return [.preset(.fun), .custom("Smiling"), .custom("Smile"), .custom("smile"), .custom("Relaxed")]
+        case .sad:
+            return [.preset(.sorrow), .custom("Sad"), .custom("sad")]
+        case .angry:
+            return [.preset(.angry), .custom("Angry"), .custom("angry")]
+        case .happy:
+            return [.preset(.joy), .custom("Happy"), .custom("happy"), .custom("Joy"), .custom("joy")]
+        case .surprised:
+            return [.custom("Surprised"), .custom("surprised"), .custom("Surprise"), .custom("surprise"), .custom("Open Wide")]
+        }
+    }
+
+    private func setBlendShape(_ value: CGFloat, for key: BlendShapeKey) {
+        vrmEntity?.setBlendShape(value: value, for: key)
+    }
+
+    private func blendShapeValue(for key: BlendShapeKey) -> CGFloat {
+        vrmEntity?.blendShape(for: key) ?? 0
+    }
+
+    private func updateExpressionAnimation(deltaTime: TimeInterval) {
+        let smoothing = CGFloat(1 - exp(-8.5 * deltaTime))
+
+        for key in primaryExpressionKeys {
+            let current = primaryExpressionCurrent[key] ?? blendShapeValue(for: key)
+            let target = primaryExpressionTargets[key] ?? 0
+            let next = current + (target - current) * smoothing
+            primaryExpressionCurrent[key] = next
+            setBlendShape(next, for: key)
+        }
+
+        let effectiveBlinkTarget: CGFloat = blinkTarget * blinkIntensity(for: activeExpression)
+        let blinkNext = blinkCurrent + (effectiveBlinkTarget - blinkCurrent) * CGFloat(1 - exp(-22.0 * deltaTime))
+        blinkCurrent = blinkNext
+        for key in blinkKeys {
+            setBlendShape(blinkNext, for: key)
+        }
+    }
+
+    private func updateMouthAnimation(deltaTime: TimeInterval) {
+        mouthTime += deltaTime
+
+        let target: CGFloat
+        switch presenceState {
+        case .speaking:
+            if speechLevel > 0.01 {
+                target = min(max(speechLevel * 1.25, 0.06), 0.95)
+            } else {
+                let base = 0.14 + 0.42 * max(0, sin(mouthTime * 10.5))
+                let accent = 0.14 * max(0, sin(mouthTime * 23.0 + 0.8))
+                target = min(base + accent, 0.78)
+            }
+        case .thinking, .listening, .idle:
+            target = 0
+        }
+
+        let smoothing = CGFloat(1 - exp(-14.0 * deltaTime))
+        mouthCurrent += (target - mouthCurrent) * smoothing
+
+        for key in mouthKeys {
+            setBlendShape(mouthCurrent, for: key)
+        }
+    }
+
+    private func updateBodyAnimation(deltaTime: TimeInterval) {
+        guard let vrmEntity else { return }
+        if vrmaPlayer != nil || posePlayer != nil {
+            vrmEntity.entity.transform.translation = rootBasePosition
+            vrmEntity.entity.transform.rotation = rootBaseRotation
+            spineEntity?.transform.rotation = spineBaseRotation
+            chestEntity?.transform.rotation = chestBaseRotation
+            neckEntity?.transform.rotation = neckBaseRotation
+            headEntity?.transform.rotation = headBaseRotation
+            if let glTFChestEntity, let glTFChestRestTransform {
+                glTFChestEntity.transform = glTFChestRestTransform
+            }
+            return
+        }
+        motionTime += deltaTime
+
+        let localMouse = currentNormalizedMousePosition()
+        let clampedX = max(-1.0, min(1.0, localMouse.x))
+        let clampedY = max(-1.0, min(1.0, localMouse.y))
+
+        let lookStateScale: Float
+        switch presenceState {
+        case .thinking:
+            lookStateScale = 0.35
+        case .listening:
+            lookStateScale = 0.95
+        case .speaking:
+            lookStateScale = 0.78
+        case .idle:
+            lookStateScale = 0.65
+        }
+
+        let lookYawTarget = clampedX * 0.22 * lookStateScale
+        let lookPitchTarget = clampedY * 0.12 * lookStateScale
+        let lookSmoothing = Float(1 - exp(-Double(7.5) * deltaTime))
+        lookYawCurrent += (lookYawTarget - lookYawCurrent) * lookSmoothing
+        lookPitchCurrent += (lookPitchTarget - lookPitchCurrent) * lookSmoothing
+
+        if !draggingActive {
+            dragYawTarget = 0
+            dragRollTarget = 0
+            dragPitchTarget = 0
+        }
+        let dragSmoothing = Float(1 - exp(-Double(9.0) * deltaTime))
+        dragYawCurrent += (dragYawTarget - dragYawCurrent) * dragSmoothing
+        dragRollCurrent += (dragRollTarget - dragRollCurrent) * dragSmoothing
+        dragPitchCurrent += (dragPitchTarget - dragPitchCurrent) * dragSmoothing
+
+        let breatheScale: Float
+        let swayScale: Float
+        switch presenceState {
+        case .thinking:
+            breatheScale = 0.010
+            swayScale = 0.020
+        case .listening:
+            breatheScale = 0.008
+            swayScale = 0.014
+        case .speaking:
+            breatheScale = 0.006
+            swayScale = 0.010
+        case .idle:
+            breatheScale = 0.012
+            swayScale = 0.024
+        }
+
+        let breatheY = sin(Float(motionTime) * 1.7) * breatheScale
+        let chestPitch = sin(Float(motionTime) * 1.3 + 0.6) * 0.014
+        let bodyYaw = sin(Float(motionTime) * 0.9 + 1.2) * swayScale
+        let bodyRoll = sin(Float(motionTime) * 1.1 + 2.0) * swayScale * 0.55
+        let headMicroRoll = sin(Float(motionTime) * 1.8 + 0.5) * 0.018
+        let thinkingTilt: Float = presenceState == .thinking ? -0.12 : 0
+        let listeningLean: Float = presenceState == .listening ? -0.03 : 0
+
+        let rootYaw = bodyYaw + dragYawCurrent
+        let rootRoll = bodyRoll + dragRollCurrent
+        let rootPitch = listeningLean + dragPitchCurrent
+
+        vrmEntity.entity.transform.translation = rootBasePosition + SIMD3<Float>(0, breatheY, 0)
+        vrmEntity.entity.transform.rotation =
+            rootBaseRotation
+            * simd_quatf(angle: rootYaw, axis: SIMD3<Float>(0, 1, 0))
+            * simd_quatf(angle: rootPitch, axis: SIMD3<Float>(1, 0, 0))
+            * simd_quatf(angle: rootRoll, axis: SIMD3<Float>(0, 0, 1))
+
+        if let spineEntity {
+            spineEntity.transform.rotation =
+                spineBaseRotation
+                * simd_quatf(angle: chestPitch * 0.45, axis: SIMD3<Float>(1, 0, 0))
+                * simd_quatf(angle: bodyYaw * 0.18, axis: SIMD3<Float>(0, 1, 0))
+        }
+
+        if let chestEntity {
+            chestEntity.transform.rotation =
+                chestBaseRotation
+                * simd_quatf(angle: chestPitch, axis: SIMD3<Float>(1, 0, 0))
+                * simd_quatf(angle: bodyYaw * 0.22, axis: SIMD3<Float>(0, 1, 0))
+                * simd_quatf(angle: bodyRoll * 0.35, axis: SIMD3<Float>(0, 0, 1))
+        }
+
+        if let neckEntity {
+            neckEntity.transform.rotation =
+                neckBaseRotation
+                * simd_quatf(angle: lookYawCurrent * 0.45, axis: SIMD3<Float>(0, 1, 0))
+                * simd_quatf(angle: lookPitchCurrent * 0.55 + thinkingTilt * 0.35, axis: SIMD3<Float>(1, 0, 0))
+                * simd_quatf(angle: headMicroRoll * 0.45, axis: SIMD3<Float>(0, 0, 1))
+        }
+
+        if let headEntity {
+            headEntity.transform.rotation =
+                headBaseRotation
+                * simd_quatf(angle: lookYawCurrent, axis: SIMD3<Float>(0, 1, 0))
+                * simd_quatf(angle: lookPitchCurrent + thinkingTilt, axis: SIMD3<Float>(1, 0, 0))
+                * simd_quatf(angle: headMicroRoll + dragRollCurrent * 0.25, axis: SIMD3<Float>(0, 0, 1))
+        }
+    }
+
+    private func currentNormalizedMousePosition() -> SIMD2<Float> {
+        guard let window else { return .zero }
+        let global = NSEvent.mouseLocation
+        let windowPoint = window.convertPoint(fromScreen: global)
+        let localPoint = convert(windowPoint, from: nil)
+        guard bounds.width > 1, bounds.height > 1 else { return .zero }
+
+        let normalizedX = Float(((localPoint.x / bounds.width) - 0.5) * 2.0)
+        let normalizedY = Float(((localPoint.y / bounds.height) - 0.5) * 2.0)
+        return SIMD2<Float>(normalizedX, normalizedY)
+    }
+
+    private func blinkIntensity(for expression: CompanionVRMExpressionPreset) -> CGFloat {
+        switch expression {
+        case .happy:
+            return 0.22
+        case .neutral, .smiling, .sad, .angry, .surprised:
+            return 1.0
+        }
+    }
+
+    override func mouseDown(with event: NSEvent) {
+        mouseDownPoint = convert(event.locationInWindow, from: nil)
+        draggedSinceMouseDown = false
+        super.mouseDown(with: event)
+    }
+
+    override func mouseDragged(with event: NSEvent) {
+        let point = convert(event.locationInWindow, from: nil)
+        let dx = point.x - mouseDownPoint.x
+        let dy = point.y - mouseDownPoint.y
+        if (dx * dx + dy * dy) > 25 {
+            draggedSinceMouseDown = true
+        }
+        let clampedDX = max(-80.0, min(80.0, dx))
+        let clampedDY = max(-80.0, min(80.0, dy))
+        dragYawTarget = Float(clampedDX / 80.0) * 0.22
+        dragRollTarget = Float(clampedDX / 80.0) * -0.16
+        dragPitchTarget = Float(clampedDY / 80.0) * -0.10
+        super.mouseDragged(with: event)
+    }
+
+    override func mouseUp(with event: NSEvent) {
+        dragYawTarget = 0
+        dragRollTarget = 0
+        dragPitchTarget = 0
+        if !draggedSinceMouseDown {
+            tapHandler?()
+        }
+        super.mouseUp(with: event)
+    }
+
+    override func scrollWheel(with event: NSEvent) {
+        scrollHandler?(event.scrollingDeltaY)
+    }
+}
+
+struct UnsupportedAvatarView: View {
+    let title: String
+    let detail: String
+
+    var body: some View {
+        VStack(spacing: 12) {
+            Image(systemName: "person.crop.rectangle.stack.fill")
+                .font(.system(size: 56, weight: .medium))
+                .foregroundStyle(.black.opacity(0.72))
+
+            Text(title)
+                .font(.system(size: 18, weight: .semibold, design: .rounded))
+                .foregroundStyle(.black.opacity(0.82))
+
+            Text(detail)
+                .font(.system(size: 13, weight: .medium, design: .rounded))
+                .foregroundStyle(.black.opacity(0.68))
+                .multilineTextAlignment(.center)
+                .frame(maxWidth: 220)
+        }
+        .frame(maxWidth: .infinity, maxHeight: .infinity)
+        .background(
+            RoundedRectangle(cornerRadius: 26, style: .continuous)
+                .fill(.white.opacity(0.72))
+                .overlay(
+                    RoundedRectangle(cornerRadius: 26, style: .continuous)
+                        .stroke(.black.opacity(0.16), lineWidth: 1.2)
+                )
+        )
+    }
+}
+
 @MainActor
 final class AvatarPanelContentView: NSView {
     private let viewModel: CompanionViewModel
     private let onToggleChat: () -> Void
-    private let live2d: CompanionLive2DView
+    private var live2d: CompanionLive2DView?
+    private var vrmView: CompanionVRMRealityView?
+    private var placeholderView: NSHostingView<UnsupportedAvatarView>?
     private var cancellables: Set<AnyCancellable> = []
-    private var currentAssetRootPath: String
+    private var currentModelIdentity: String
+    private var currentRuntime: CompanionAvatarRuntime
 
     init(viewModel: CompanionViewModel, onToggleChat: @escaping () -> Void) {
         self.viewModel = viewModel
         self.onToggleChat = onToggleChat
-        self.live2d = CompanionLive2DView(frame: .zero)
-        self.currentAssetRootPath = viewModel.selectedModel.assetRootPath
+        self.currentModelIdentity = viewModel.selectedModel.id
+        self.currentRuntime = viewModel.selectedModel.runtime
         super.init(frame: .zero)
 
         wantsLayer = true
         layer?.backgroundColor = NSColor.clear.cgColor
-
-        live2d.translatesAutoresizingMaskIntoConstraints = false
-        live2d.assetRootPath = currentAssetRootPath
-        live2d.passiveIdle = viewModel.selectedModel.preset.passiveIdle
-        live2d.emotionExpressionMap = viewModel.selectedModel.preset.emotionExpressions
-        live2d.presenceState = viewModel.presenceState.rawValue
-        live2d.emotionState = viewModel.emotionState.rawValue
-        live2d.draggingActive = viewModel.isAvatarDragging
-        live2d.manualEmotionPreview = viewModel.isManualPreviewMode
-        live2d.tapHandler = { [weak self] in
-            self?.onToggleChat()
-        }
-        live2d.scrollHandler = { [weak self] deltaY in
-            DispatchQueue.main.async {
-                self?.viewModel.adjustAvatarZoom(byScrollDelta: deltaY)
-            }
-        }
-        live2d.modelAspectRatioHandler = { [weak self] aspectRatio in
-            DispatchQueue.main.async {
-                self?.viewModel.updateAvatarAspectRatio(aspectRatio)
-            }
-        }
-
-        addSubview(live2d)
-
-        NSLayoutConstraint.activate([
-            live2d.leadingAnchor.constraint(equalTo: leadingAnchor),
-            live2d.trailingAnchor.constraint(equalTo: trailingAnchor),
-            live2d.topAnchor.constraint(equalTo: topAnchor),
-            live2d.bottomAnchor.constraint(equalTo: bottomAnchor)
-        ])
-
-        live2d.startRenderer()
+        installAvatarView(for: viewModel.selectedModel)
         updateFromViewModel()
         bindViewModel()
     }
@@ -702,35 +1407,45 @@ final class AvatarPanelContentView: NSView {
         viewModel.$presenceState
             .receive(on: RunLoop.main)
             .sink { [weak self] state in
-                self?.live2d.presenceState = state.rawValue
+                self?.live2d?.presenceState = state.rawValue
+                self?.vrmView?.presenceState = state
+            }
+            .store(in: &cancellables)
+
+        viewModel.speech.$speechLevel
+            .receive(on: RunLoop.main)
+            .sink { [weak self] level in
+                self?.vrmView?.speechLevel = level
             }
             .store(in: &cancellables)
 
         viewModel.$emotionState
             .receive(on: RunLoop.main)
             .sink { [weak self] state in
-                self?.live2d.emotionState = state.rawValue
+                self?.live2d?.emotionState = state.rawValue
             }
             .store(in: &cancellables)
 
         viewModel.$manualEmotionOverride
             .receive(on: RunLoop.main)
             .sink { [weak self] _ in
-                self?.live2d.manualEmotionPreview = self?.viewModel.isManualPreviewMode ?? false
+                self?.live2d?.manualEmotionPreview = self?.viewModel.isManualPreviewMode ?? false
+                self?.vrmView?.applyEmotionPreview(self?.viewModel.manualEmotionOverride)
             }
             .store(in: &cancellables)
 
         viewModel.$isManualPreviewMode
             .receive(on: RunLoop.main)
             .sink { [weak self] enabled in
-                self?.live2d.manualEmotionPreview = enabled
+                self?.live2d?.manualEmotionPreview = enabled
             }
             .store(in: &cancellables)
 
         viewModel.$isAvatarDragging
             .receive(on: RunLoop.main)
             .sink { [weak self] dragging in
-                self?.live2d.draggingActive = dragging
+                self?.live2d?.draggingActive = dragging
+                self?.vrmView?.draggingActive = dragging
             }
             .store(in: &cancellables)
 
@@ -738,7 +1453,7 @@ final class AvatarPanelContentView: NSView {
             .compactMap { $0 }
             .receive(on: RunLoop.main)
             .sink { [weak self] request in
-                self?.live2d.triggerExpressionHints(request.hints)
+                self?.live2d?.triggerExpressionHints(request.hints)
             }
             .store(in: &cancellables)
 
@@ -746,23 +1461,139 @@ final class AvatarPanelContentView: NSView {
             .compactMap { $0 }
             .receive(on: RunLoop.main)
             .sink { [weak self] request in
-                self?.live2d.triggerMotionGroup(request.groupName)
+                self?.live2d?.triggerMotionGroup(request.groupName)
+            }
+            .store(in: &cancellables)
+
+        viewModel.$manualVRMARequest
+            .compactMap { $0 }
+            .receive(on: RunLoop.main)
+            .sink { [weak self] request in
+                self?.vrmView?.playVRMA(filePath: request.filePath)
+            }
+            .store(in: &cancellables)
+
+        viewModel.$manualPoseRequest
+            .receive(on: RunLoop.main)
+            .sink { [weak self] request in
+                if let request {
+                    self?.vrmView?.applyPose(filePath: request.filePath)
+                } else {
+                    self?.vrmView?.clearPose()
+                }
+            }
+            .store(in: &cancellables)
+
+        viewModel.$manualVRMExpressionRequest
+            .receive(on: RunLoop.main)
+            .sink { [weak self] request in
+                guard let self, let vrmView = self.vrmView else { return }
+                if let request {
+                    vrmView.applyExpression(request.expression)
+                } else {
+                    vrmView.applyExpression(.neutral)
+                }
             }
             .store(in: &cancellables)
 
     }
 
+    private func installAvatarView(for model: CompanionModelOption) {
+        subviews.forEach { $0.removeFromSuperview() }
+        live2d = nil
+        vrmView = nil
+        placeholderView = nil
+
+        switch model.runtime {
+        case .live2d:
+            let live2d = CompanionLive2DView(frame: .zero)
+            live2d.translatesAutoresizingMaskIntoConstraints = false
+            live2d.assetRootPath = model.assetRootPath
+            live2d.passiveIdle = model.preset.passiveIdle
+            live2d.emotionExpressionMap = model.preset.emotionExpressions
+            live2d.presenceState = viewModel.presenceState.rawValue
+            live2d.emotionState = viewModel.emotionState.rawValue
+            live2d.draggingActive = viewModel.isAvatarDragging
+            live2d.manualEmotionPreview = viewModel.isManualPreviewMode
+            live2d.tapHandler = { [weak self] in
+                self?.onToggleChat()
+            }
+            live2d.scrollHandler = { [weak self] deltaY in
+                DispatchQueue.main.async {
+                    self?.viewModel.adjustAvatarZoom(byScrollDelta: deltaY)
+                }
+            }
+            live2d.modelAspectRatioHandler = { [weak self] aspectRatio in
+                DispatchQueue.main.async {
+                    self?.viewModel.updateAvatarAspectRatio(aspectRatio)
+                }
+            }
+            addPinnedSubview(live2d)
+            live2d.startRenderer()
+            self.live2d = live2d
+
+        case .vrm:
+            let vrmView = CompanionVRMRealityView(frame: .zero)
+            vrmView.translatesAutoresizingMaskIntoConstraints = false
+            vrmView.filePath = model.entryPath
+            vrmView.tapHandler = { [weak self] in
+                self?.onToggleChat()
+            }
+            vrmView.scrollHandler = { [weak self] deltaY in
+                DispatchQueue.main.async {
+                    self?.viewModel.adjustAvatarZoom(byScrollDelta: deltaY)
+                }
+            }
+            vrmView.aspectRatioHandler = { [weak self] aspectRatio in
+                DispatchQueue.main.async {
+                    self?.viewModel.updateAvatarAspectRatio(aspectRatio)
+                }
+            }
+            vrmView.presenceState = viewModel.presenceState
+            vrmView.speechLevel = viewModel.speech.speechLevel
+            vrmView.draggingActive = viewModel.isAvatarDragging
+            addPinnedSubview(vrmView)
+            vrmView.reloadModel()
+            self.vrmView = vrmView
+
+        case .vroidProject:
+            let placeholder = NSHostingView(
+                rootView: UnsupportedAvatarView(
+                    title: model.displayName,
+                    detail: "Это проект VRoid Studio. Экспортируй его как .vrm, и я смогу использовать его как полноценный 3D-аватар."
+                )
+            )
+            placeholder.translatesAutoresizingMaskIntoConstraints = false
+            addPinnedSubview(placeholder)
+            viewModel.updateAvatarAspectRatio(0.62)
+            self.placeholderView = placeholder
+        }
+    }
+
+    private func addPinnedSubview(_ subview: NSView) {
+        addSubview(subview)
+        NSLayoutConstraint.activate([
+            subview.leadingAnchor.constraint(equalTo: leadingAnchor),
+            subview.trailingAnchor.constraint(equalTo: trailingAnchor),
+            subview.topAnchor.constraint(equalTo: topAnchor),
+            subview.bottomAnchor.constraint(equalTo: bottomAnchor)
+        ])
+    }
+
     private func updateFromViewModel() {
-        let newAssetRootPath = viewModel.selectedModel.assetRootPath
-        if currentAssetRootPath != newAssetRootPath {
-            currentAssetRootPath = newAssetRootPath
-            live2d.assetRootPath = newAssetRootPath
-            live2d.passiveIdle = viewModel.selectedModel.preset.passiveIdle
-            live2d.emotionExpressionMap = viewModel.selectedModel.preset.emotionExpressions
-            live2d.reloadModel()
-        } else {
-            live2d.passiveIdle = viewModel.selectedModel.preset.passiveIdle
-            live2d.emotionExpressionMap = viewModel.selectedModel.preset.emotionExpressions
+        let selectedModel = viewModel.selectedModel
+        let newModelIdentity = selectedModel.id
+        let runtimeChanged = currentRuntime != selectedModel.runtime
+
+        if runtimeChanged || currentModelIdentity != newModelIdentity {
+            currentRuntime = selectedModel.runtime
+            currentModelIdentity = newModelIdentity
+            installAvatarView(for: selectedModel)
+        }
+
+        if let live2d {
+            live2d.passiveIdle = selectedModel.preset.passiveIdle
+            live2d.emotionExpressionMap = selectedModel.preset.emotionExpressions
         }
     }
 }

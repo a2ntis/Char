@@ -7,11 +7,15 @@ final class SpeechCoordinator: NSObject, ObservableObject, @unchecked Sendable, 
     @Published var canUseSpeechInput = false
     @Published var isListening = false
     @Published var isSpeaking = false
+    @Published var speechLevel: CGFloat = 0
     @Published var lastStatusMessage = ""
 
     private let synthesizer = AVSpeechSynthesizer()
     private let audioEngine = AVAudioEngine()
     private let recognizer = SFSpeechRecognizer(locale: Locale(identifier: "en-US"))
+    private let streamPlaybackEngine = AVAudioEngine()
+    private let streamPlaybackNode = AVAudioPlayerNode()
+    private let geminiStreamFormat = AVAudioFormat(commonFormat: .pcmFormatInt16, sampleRate: 24_000, channels: 1, interleaved: true)
     private var recognitionRequest: SFSpeechAudioBufferRecognitionRequest?
     private var recognitionTask: SFSpeechRecognitionTask?
     private var audioPlayer: AVAudioPlayer?
@@ -24,10 +28,25 @@ final class SpeechCoordinator: NSObject, ObservableObject, @unchecked Sendable, 
     private var openAITotalChunkCount = 0
     private var openAICompletedChunkCount = 0
     private var openAIHadChunkFailure = false
+    private var openAIStreamTask: Task<Void, Never>?
+    private var openAIPendingBufferCount = 0
+    private var openAIDidFinishStreaming = false
+    private var openAIDidStartPlayback = false
+    private var geminiStreamTask: Task<Void, Never>?
+    private var geminiPendingBufferCount = 0
+    private var geminiDidFinishStreaming = false
+    private var geminiDidStartPlayback = false
+    private var audioMeterTimer: Timer?
+    private var speechLevelDecayTimer: Timer?
+    private var geminiSpeechLevelHoldUntil: Date?
 
     override init() {
         super.init()
         synthesizer.delegate = self
+        streamPlaybackEngine.attach(streamPlaybackNode)
+        if let geminiStreamFormat {
+            streamPlaybackEngine.connect(streamPlaybackNode, to: streamPlaybackEngine.mainMixerNode, format: geminiStreamFormat)
+        }
     }
 
     func warmUp() {
@@ -65,6 +84,8 @@ final class SpeechCoordinator: NSObject, ObservableObject, @unchecked Sendable, 
             speakWithXTTS(speechText, pythonPath: profile.xttsPythonPath, referencePath: profile.xttsReferencePath, language: profile.responseLanguage)
         case .openAI:
             speakWithOpenAI(speechText, profile: profile, apiKey: openAIAPIKey)
+        case .gemini:
+            speakWithGemini(speechText, profile: profile)
         }
     }
 
@@ -292,6 +313,19 @@ final class SpeechCoordinator: NSObject, ObservableObject, @unchecked Sendable, 
             : profile.openAITTSVoice.trimmingCharacters(in: .whitespacesAndNewlines)
         let instructions = profile.openAITTSInstructions.trimmingCharacters(in: .whitespacesAndNewlines)
 
+        if model == "gpt-4o-mini-tts" {
+            speakWithOpenAIStreaming(
+                text,
+                model: model,
+                voice: voice,
+                speed: min(max(profile.openAITTSSpeed, 0.25), 4.0),
+                instructions: instructions.isEmpty ? nil : instructions,
+                endpoint: profile.openAITTSEndpoint,
+                apiKey: trimmedKey
+            )
+            return
+        }
+
         struct RequestBody: Encodable {
             let model: String
             let voice: String
@@ -355,6 +389,387 @@ final class SpeechCoordinator: NSObject, ObservableObject, @unchecked Sendable, 
                 apiKey: trimmedKey
             )
         }
+    }
+
+    private func speakWithOpenAIStreaming(
+        _ text: String,
+        model: String,
+        voice: String,
+        speed: Double,
+        instructions: String?,
+        endpoint: URL,
+        apiKey: String
+    ) {
+        struct RequestBody: Encodable {
+            let model: String
+            let voice: String
+            let input: String
+            let format: String
+            let streamFormat: String
+            let speed: Double
+            let instructions: String?
+
+            enum CodingKeys: String, CodingKey {
+                case model
+                case voice
+                case input
+                case format = "response_format"
+                case streamFormat = "stream_format"
+                case speed
+                case instructions
+            }
+        }
+
+        var request = URLRequest(url: endpoint)
+        request.httpMethod = "POST"
+        request.setValue("Bearer \(apiKey)", forHTTPHeaderField: "Authorization")
+        request.setValue("application/json", forHTTPHeaderField: "Content-Type")
+        request.setValue("text/event-stream", forHTTPHeaderField: "Accept")
+
+        do {
+            request.httpBody = try JSONEncoder().encode(
+                RequestBody(
+                    model: model,
+                    voice: voice,
+                    input: text,
+                    format: "pcm",
+                    streamFormat: "sse",
+                    speed: speed,
+                    instructions: instructions
+                )
+            )
+        } catch {
+            updateStatus("Не удалось подготовить OpenAI TTS запрос: \(error.localizedDescription)")
+            return
+        }
+
+        setSpeaking(true)
+        updateStatus("OpenAI TTS готовит поток речи...")
+        openAIStreamTask?.cancel()
+        openAIPendingBufferCount = 0
+        openAIDidFinishStreaming = false
+        openAIDidStartPlayback = false
+        geminiSpeechLevelHoldUntil = nil
+        streamPlaybackNode.stop()
+
+        openAIStreamTask = Task { [weak self] in
+            guard let self else { return }
+            do {
+                let (bytes, response) = try await URLSession.shared.bytes(for: request)
+                guard let httpResponse = response as? HTTPURLResponse else {
+                    throw OpenAITTSError.invalidResponse
+                }
+                guard (200..<300).contains(httpResponse.statusCode) else {
+                    throw OpenAITTSError.serverMessage("OpenAI TTS вернул ошибку HTTP \(httpResponse.statusCode).")
+                }
+
+                for try await line in bytes.lines {
+                    if Task.isCancelled { return }
+                    let trimmed = line.trimmingCharacters(in: .whitespacesAndNewlines)
+                    guard trimmed.hasPrefix("data:") else { continue }
+                    let payload = trimmed.dropFirst(5).trimmingCharacters(in: .whitespacesAndNewlines)
+                    guard !payload.isEmpty, payload != "[DONE]" else { continue }
+                    guard let jsonData = payload.data(using: .utf8) else { continue }
+
+                    if let event = try? JSONDecoder().decode(OpenAITTSStreamEvent.self, from: jsonData) {
+                        switch event.type {
+                        case "speech.audio.delta":
+                            if let audio = event.audio, let pcmData = Data(base64Encoded: audio) {
+                                DispatchQueue.main.async {
+                                    self.enqueueOpenAIPCMData(pcmData)
+                                }
+                            }
+                        case "speech.audio.done":
+                            DispatchQueue.main.async {
+                                self.openAIDidFinishStreaming = true
+                                self.finishOpenAIStreamIfNeeded()
+                            }
+                        default:
+                            break
+                        }
+                    }
+                }
+
+                DispatchQueue.main.async {
+                    self.openAIDidFinishStreaming = true
+                    self.finishOpenAIStreamIfNeeded()
+                }
+            } catch {
+                DispatchQueue.main.async {
+                    self.setSpeaking(false)
+                    self.updateStatus(error.localizedDescription)
+                    self.stopOpenAIStreamPlayback()
+                }
+            }
+        }
+    }
+
+    private func speakWithGemini(_ text: String, profile: CompanionProfile) {
+        let apiKey = UserDefaults.standard.string(forKey: "googleTTSAPIKey")?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
+        guard !apiKey.isEmpty else {
+            updateStatus("Для Gemini TTS нужен Gemini API key.")
+            return
+        }
+
+        let voiceName = profile.googleTTSVoiceName.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !voiceName.isEmpty else {
+            updateStatus("Для Gemini TTS нужно выбрать голос.")
+            return
+        }
+
+        let model = profile.googleTTSModel.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+            ? "gemini-2.5-flash-preview-tts"
+            : profile.googleTTSModel.trimmingCharacters(in: .whitespacesAndNewlines)
+
+        struct RequestBody: Encodable {
+            struct Content: Encodable {
+                struct Part: Encodable {
+                    let text: String
+                }
+                let parts: [Part]
+            }
+
+            struct GenerationConfig: Encodable {
+                struct SpeechConfig: Encodable {
+                    struct VoiceConfig: Encodable {
+                        struct PrebuiltVoiceConfig: Encodable {
+                            let voiceName: String
+                        }
+                        let prebuiltVoiceConfig: PrebuiltVoiceConfig
+                    }
+
+                    let voiceConfig: VoiceConfig
+                }
+
+                let responseModalities: [String]
+                let speechConfig: SpeechConfig
+            }
+
+            let contents: [Content]
+            let generationConfig: GenerationConfig
+        }
+
+        let effectiveInstructions = profile.googleTTSStyleInstructions.trimmingCharacters(in: .whitespacesAndNewlines)
+        let prompt = effectiveInstructions.isEmpty ? text : "\(effectiveInstructions)\n\nSay exactly this text:\n\(text)"
+
+        guard let baseURL = URL(string: "\(profile.googleTTSEndpoint.absoluteString)/models/\(model):streamGenerateContent?alt=sse") else {
+            updateStatus("Некорректный endpoint Gemini TTS.")
+            return
+        }
+
+        var request = URLRequest(url: baseURL)
+        request.httpMethod = "POST"
+        request.setValue("application/json", forHTTPHeaderField: "Content-Type")
+        request.setValue(apiKey, forHTTPHeaderField: "x-goog-api-key")
+
+        do {
+            request.httpBody = try JSONEncoder().encode(
+                RequestBody(
+                    contents: [
+                        .init(parts: [.init(text: prompt)])
+                    ],
+                    generationConfig: .init(
+                        responseModalities: ["AUDIO"],
+                        speechConfig: .init(
+                            voiceConfig: .init(
+                                prebuiltVoiceConfig: .init(voiceName: voiceName)
+                            )
+                        )
+                    )
+                )
+            )
+        } catch {
+            updateStatus("Не удалось подготовить Gemini TTS запрос: \(error.localizedDescription)")
+            return
+        }
+
+        setSpeaking(true)
+        updateStatus("Gemini TTS готовит поток речи...")
+        geminiStreamTask?.cancel()
+        geminiPendingBufferCount = 0
+        geminiDidFinishStreaming = false
+        geminiDidStartPlayback = false
+        streamPlaybackNode.stop()
+
+        geminiStreamTask = Task { [weak self] in
+            guard let self else { return }
+            do {
+                let (bytes, response) = try await URLSession.shared.bytes(for: request)
+                guard let httpResponse = response as? HTTPURLResponse else {
+                    throw OpenAITTSError.invalidResponse
+                }
+                guard (200..<300).contains(httpResponse.statusCode) else {
+                    throw OpenAITTSError.serverMessage("Gemini TTS вернул ошибку HTTP \(httpResponse.statusCode).")
+                }
+
+                for try await line in bytes.lines {
+                    if Task.isCancelled { return }
+                    let trimmed = line.trimmingCharacters(in: .whitespacesAndNewlines)
+                    guard trimmed.hasPrefix("data:") else { continue }
+                    let payload = trimmed.dropFirst(5).trimmingCharacters(in: .whitespacesAndNewlines)
+                    guard !payload.isEmpty else { continue }
+                    guard let jsonData = payload.data(using: .utf8) else { continue }
+
+                    if let chunk = try? JSONDecoder().decode(GeminiTTSStreamResponse.self, from: jsonData),
+                       let base64 = chunk.candidates.first?.content.parts.first(where: { $0.inlineData != nil })?.inlineData?.data,
+                       let pcmData = Data(base64Encoded: base64) {
+                        DispatchQueue.main.async {
+                            self.enqueueGeminiPCMData(pcmData)
+                        }
+                    }
+                }
+
+                DispatchQueue.main.async {
+                    self.geminiDidFinishStreaming = true
+                    self.finishGeminiStreamIfNeeded()
+                }
+            } catch {
+                DispatchQueue.main.async {
+                    self.setSpeaking(false)
+                    self.updateStatus(error.localizedDescription)
+                    self.stopGeminiStreamPlayback()
+                }
+            }
+        }
+    }
+
+    private func enqueueGeminiPCMData(_ pcmData: Data) {
+        guard let format = geminiStreamFormat else { return }
+        guard let pcmBuffer = makePCMBuffer(from: pcmData, format: format) else { return }
+        updateGeminiSpeechLevel(from: pcmData)
+
+        do {
+            if !streamPlaybackEngine.isRunning {
+                try streamPlaybackEngine.start()
+            }
+        } catch {
+            setSpeaking(false)
+            updateStatus("Не удалось запустить аудио-движок Gemini TTS: \(error.localizedDescription)")
+            return
+        }
+
+        geminiPendingBufferCount += 1
+        streamPlaybackNode.scheduleBuffer(pcmBuffer) { [weak self] in
+            DispatchQueue.main.async {
+                guard let self else { return }
+                self.geminiPendingBufferCount = max(0, self.geminiPendingBufferCount - 1)
+                self.finishGeminiStreamIfNeeded()
+            }
+        }
+
+        if !geminiDidStartPlayback {
+            geminiDidStartPlayback = true
+            streamPlaybackNode.play()
+            updateStatus("Gemini TTS начал воспроизведение.")
+        }
+    }
+
+    private func enqueueOpenAIPCMData(_ pcmData: Data) {
+        guard let format = geminiStreamFormat else { return }
+        guard let pcmBuffer = makePCMBuffer(from: pcmData, format: format) else { return }
+        updateGeminiSpeechLevel(from: pcmData)
+
+        do {
+            if !streamPlaybackEngine.isRunning {
+                try streamPlaybackEngine.start()
+            }
+        } catch {
+            setSpeaking(false)
+            updateStatus("Не удалось запустить аудио-движок OpenAI TTS: \(error.localizedDescription)")
+            return
+        }
+
+        openAIPendingBufferCount += 1
+        streamPlaybackNode.scheduleBuffer(pcmBuffer) { [weak self] in
+            DispatchQueue.main.async {
+                guard let self else { return }
+                self.openAIPendingBufferCount = max(0, self.openAIPendingBufferCount - 1)
+                self.finishOpenAIStreamIfNeeded()
+            }
+        }
+
+        if !openAIDidStartPlayback {
+            openAIDidStartPlayback = true
+            streamPlaybackNode.play()
+            updateStatus("OpenAI TTS начал воспроизведение.")
+        }
+    }
+
+    private func updateGeminiSpeechLevel(from pcmData: Data) {
+        let sampleCount = pcmData.count / MemoryLayout<Int16>.stride
+        guard sampleCount > 0 else { return }
+
+        let rms: CGFloat = pcmData.withUnsafeBytes { rawBuffer in
+            guard let base = rawBuffer.bindMemory(to: Int16.self).baseAddress else { return 0 }
+            var sum: Double = 0
+            for index in 0..<sampleCount {
+                let sample = Double(base[index]) / Double(Int16.max)
+                sum += sample * sample
+            }
+            return CGFloat(sqrt(sum / Double(sampleCount)))
+        }
+
+        setSpeechLevel(min(max(rms * 2.8, 0), 1))
+        geminiSpeechLevelHoldUntil = Date().addingTimeInterval(0.08)
+        startSpeechLevelDecayIfNeeded()
+    }
+
+    private func makePCMBuffer(from pcmData: Data, format: AVAudioFormat) -> AVAudioPCMBuffer? {
+        let bytesPerFrame = Int(format.streamDescription.pointee.mBytesPerFrame)
+        guard bytesPerFrame > 0 else { return nil }
+        let frameCount = UInt32(pcmData.count / bytesPerFrame)
+        guard frameCount > 0 else { return nil }
+        guard let buffer = AVAudioPCMBuffer(pcmFormat: format, frameCapacity: frameCount) else { return nil }
+        buffer.frameLength = frameCount
+
+        pcmData.withUnsafeBytes { rawBuffer in
+            if let source = rawBuffer.bindMemory(to: Int16.self).baseAddress,
+               let destination = buffer.int16ChannelData?.pointee {
+                destination.update(from: source, count: Int(frameCount))
+            }
+        }
+
+        return buffer
+    }
+
+    private func finishGeminiStreamIfNeeded() {
+        guard geminiDidFinishStreaming, geminiPendingBufferCount == 0 else { return }
+        stopGeminiStreamPlayback()
+        setSpeaking(false)
+        updateStatus("")
+    }
+
+    private func stopGeminiStreamPlayback() {
+        geminiStreamTask?.cancel()
+        geminiStreamTask = nil
+        geminiPendingBufferCount = 0
+        geminiDidFinishStreaming = false
+        geminiDidStartPlayback = false
+        geminiSpeechLevelHoldUntil = nil
+        streamPlaybackNode.stop()
+        streamPlaybackEngine.pause()
+        stopSpeechLevelDecay()
+        setSpeechLevel(0)
+    }
+
+    private func finishOpenAIStreamIfNeeded() {
+        guard openAIDidFinishStreaming, openAIPendingBufferCount == 0 else { return }
+        stopOpenAIStreamPlayback()
+        setSpeaking(false)
+        updateStatus("")
+    }
+
+    private func stopOpenAIStreamPlayback() {
+        openAIStreamTask?.cancel()
+        openAIStreamTask = nil
+        openAIPendingBufferCount = 0
+        openAIDidFinishStreaming = false
+        openAIDidStartPlayback = false
+        geminiSpeechLevelHoldUntil = nil
+        streamPlaybackNode.stop()
+        streamPlaybackEngine.pause()
+        stopSpeechLevelDecay()
+        setSpeechLevel(0)
     }
 
     private func requestOpenAIChunk(
@@ -518,6 +933,7 @@ final class SpeechCoordinator: NSObject, ObservableObject, @unchecked Sendable, 
             currentAudioFileURL = url
             let player = try AVAudioPlayer(contentsOf: url)
             player.delegate = self
+            player.isMeteringEnabled = true
             player.prepareToPlay()
             audioPlayer = player
             if !player.play() {
@@ -525,6 +941,7 @@ final class SpeechCoordinator: NSObject, ObservableObject, @unchecked Sendable, 
                 updateStatus("Piper сгенерировал файл, но проиграть его не получилось.")
                 cleanupAudioFile()
             } else {
+                startAudioMetering()
                 updateStatus("")
             }
         } catch {
@@ -532,6 +949,61 @@ final class SpeechCoordinator: NSObject, ObservableObject, @unchecked Sendable, 
             updateStatus("Не удалось воспроизвести Piper audio: \(error.localizedDescription)")
             cleanupAudioFile()
         }
+    }
+
+    private func startAudioMetering() {
+        stopAudioMetering()
+        audioMeterTimer = Timer.scheduledTimer(withTimeInterval: 1.0 / 30.0, repeats: true) { [weak self] _ in
+            guard let self else { return }
+            guard let player = self.audioPlayer, player.isPlaying else {
+                self.setSpeechLevel(0)
+                return
+            }
+
+            player.updateMeters()
+            let averagePower = player.averagePower(forChannel: 0)
+            let clamped = max(-60.0, min(0.0, averagePower))
+            let normalized = pow(10.0, clamped / 20.0)
+            self.setSpeechLevel(CGFloat(normalized))
+        }
+
+        if let audioMeterTimer {
+            RunLoop.main.add(audioMeterTimer, forMode: .common)
+        }
+    }
+
+    private func stopAudioMetering() {
+        audioMeterTimer?.invalidate()
+        audioMeterTimer = nil
+        setSpeechLevel(0)
+    }
+
+    private func startSpeechLevelDecayIfNeeded() {
+        guard speechLevelDecayTimer == nil else { return }
+        speechLevelDecayTimer = Timer.scheduledTimer(withTimeInterval: 1.0 / 30.0, repeats: true) { [weak self] _ in
+            guard let self else { return }
+            let now = Date()
+            if let holdUntil = self.geminiSpeechLevelHoldUntil, now < holdUntil {
+                return
+            }
+
+            let next = self.speechLevel * 0.72
+            if next < 0.02 {
+                self.setSpeechLevel(0)
+                self.stopSpeechLevelDecay()
+            } else {
+                self.setSpeechLevel(next)
+            }
+        }
+
+        if let speechLevelDecayTimer {
+            RunLoop.main.add(speechLevelDecayTimer, forMode: .common)
+        }
+    }
+
+    private func stopSpeechLevelDecay() {
+        speechLevelDecayTimer?.invalidate()
+        speechLevelDecayTimer = nil
     }
 
     private func sanitizeForSpeech(_ text: String) -> String {
@@ -572,11 +1044,13 @@ final class SpeechCoordinator: NSObject, ObservableObject, @unchecked Sendable, 
         if openAITTSSessionID != nil {
             playNextOpenAIChunkIfReady()
         } else {
+            stopAudioMetering()
             setSpeaking(false)
         }
     }
 
     func audioPlayerDecodeErrorDidOccur(_ player: AVAudioPlayer, error: Error?) {
+        stopAudioMetering()
         setSpeaking(false)
         updateStatus(error?.localizedDescription ?? "Ошибка декодирования Piper audio.")
         cleanupAudioFile()
@@ -634,6 +1108,10 @@ final class SpeechCoordinator: NSObject, ObservableObject, @unchecked Sendable, 
         synthesizer.stopSpeaking(at: .immediate)
         currentSpeechProcess?.terminate()
         currentSpeechProcess = nil
+        stopOpenAIStreamPlayback()
+        stopGeminiStreamPlayback()
+        stopAudioMetering()
+        stopSpeechLevelDecay()
         audioPlayer?.stop()
         audioPlayer = nil
         cleanupAudioFile()
@@ -654,9 +1132,18 @@ final class SpeechCoordinator: NSObject, ObservableObject, @unchecked Sendable, 
         }
     }
 
+    private func setSpeechLevel(_ value: CGFloat) {
+        DispatchQueue.main.async {
+            self.speechLevel = min(max(value, 0), 1)
+        }
+    }
+
     private func setSpeaking(_ value: Bool) {
         DispatchQueue.main.async {
             self.isSpeaking = value
+            if !value {
+                self.speechLevel = 0
+            }
         }
     }
 
@@ -778,6 +1265,32 @@ enum OpenAITTSError: LocalizedError {
             return message
         }
     }
+}
+
+private struct GeminiTTSStreamResponse: Decodable {
+    struct Candidate: Decodable {
+        struct Content: Decodable {
+            struct Part: Decodable {
+                struct InlineData: Decodable {
+                    let data: String
+                    let mimeType: String?
+                }
+
+                let inlineData: InlineData?
+            }
+
+            let parts: [Part]
+        }
+
+        let content: Content
+    }
+
+    let candidates: [Candidate]
+}
+
+private struct OpenAITTSStreamEvent: Decodable {
+    let type: String
+    let audio: String?
 }
 
 enum SpeechError: LocalizedError {

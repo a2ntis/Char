@@ -1,0 +1,27 @@
+{
+	"Version": 3,
+	"FileReferences": {
+		"Moc": "High school girl Kui.moc3",
+		"Textures": [
+			"High school girl Kui.4096/texture_00.png",
+			"High school girl Kui.4096/texture_01.png"
+		],
+		"Physics": "High school girl Kui.physics3.json",
+		"DisplayInfo": "High school girl Kui.cdi3.json"
+	},
+	"Groups": [
+		{
+			"Target": "Parameter",
+			"Name": "LipSync",
+			"Ids": []
+		},
+		{
+			"Target": "Parameter",
+			"Name": "EyeBlink",
+			"Ids": [
+				"ParamEyeROpen",
+				"ParamEyeLOpen"
+			]
+		}
+	]
+}

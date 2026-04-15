@@ -35,10 +35,22 @@ struct CompanionSettingsView: View {
                     )
                 ) {
                     ForEach(viewModel.availableModels) { model in
-                        Text(model.displayName).tag(model.id)
+                        if model.isVRM0x {
+                            Text("\(model.displayName) (VRM 0.x — не поддерж.)")
+                                .foregroundStyle(.secondary)
+                                .tag(model.id)
+                        } else {
+                            Text(model.displayName).tag(model.id)
+                        }
                     }
                 }
                 .pickerStyle(.menu)
+
+                if viewModel.selectedModel.isVRM0x {
+                    Text("VRM 0.x не полностью поддерживается — позы и анимации могут отображаться некорректно. Экспортируй модель как VRM 1.0 из VRoid Studio.")
+                        .font(.caption)
+                        .foregroundStyle(.orange)
+                }
 
                 Picker(
                     "Язык ответа",
@@ -204,7 +216,7 @@ struct CompanionSettingsView: View {
                             viewModel.refreshXTTSReferences()
                         }
                     }
-                } else {
+                } else if viewModel.profile.ttsProvider == .openAI {
                     Picker(
                         "Модель OpenAI TTS",
                         selection: Binding(
@@ -283,6 +295,86 @@ struct CompanionSettingsView: View {
                     Text(viewModel.openAITTSStatusSummary)
                         .font(.footnote)
                         .foregroundStyle(.secondary)
+                } else {
+                    SecureField(
+                        "Gemini API Key",
+                        text: Binding(
+                            get: { viewModel.googleTTSAPIKey },
+                            set: { viewModel.setGoogleTTSAPIKey($0) }
+                        )
+                    )
+                    .textFieldStyle(.roundedBorder)
+
+                    TextField(
+                        "Endpoint Gemini API",
+                        text: Binding(
+                            get: { viewModel.googleTTSEndpointText },
+                            set: { viewModel.setGoogleTTSEndpoint($0) }
+                        )
+                    )
+                    .textFieldStyle(.roundedBorder)
+
+                    Picker(
+                        "Модель Gemini TTS",
+                        selection: Binding(
+                            get: { viewModel.profile.googleTTSModel },
+                            set: { viewModel.setGoogleTTSModel($0) }
+                        )
+                    ) {
+                        ForEach(GeminiTTSCatalog.supportedModels, id: \.self) { model in
+                            Text(model).tag(model)
+                        }
+                    }
+                    .pickerStyle(.menu)
+
+                    if !viewModel.filteredGoogleTTSVoices.isEmpty {
+                        Picker(
+                            "Голос Gemini",
+                            selection: Binding(
+                                get: { viewModel.profile.googleTTSVoiceName },
+                                set: { viewModel.setGoogleTTSVoiceName($0) }
+                            )
+                        ) {
+                            ForEach(viewModel.filteredGoogleTTSVoices) { voice in
+                                Text(voice.displayName).tag(voice.name)
+                            }
+                        }
+                        .pickerStyle(.menu)
+                    }
+
+                    VStack(alignment: .leading, spacing: 6) {
+                        Text("Инструкции для голоса")
+                            .font(.footnote)
+                            .foregroundStyle(.secondary)
+
+                        TextEditor(
+                            text: Binding(
+                                get: { viewModel.googleTTSStyleInstructionsText },
+                                set: { viewModel.setGoogleTTSStyleInstructions($0) }
+                            )
+                        )
+                        .frame(minHeight: 96)
+                        .overlay(
+                            RoundedRectangle(cornerRadius: 8)
+                                .stroke(Color.black.opacity(0.12), lineWidth: 1)
+                        )
+                    }
+
+                    Text("У Gemini TTS стиль лучше задавать текстом: мягкий, youthful, warm, conversational. Голос и prompt тут важнее, чем numeric-крутилки.")
+                        .font(.footnote)
+                        .foregroundStyle(.secondary)
+
+                    Text("Для минимальной задержки лучше начинать с `gemini-2.5-flash-lite-preview-tts`. Более тяжелые модели обычно звучат богаче, но стартуют медленнее.")
+                        .font(.footnote)
+                        .foregroundStyle(.secondary)
+
+                    Text(viewModel.googleTTSStatusSummary)
+                        .font(.footnote)
+                        .foregroundStyle(.secondary)
+
+                    Button("Обновить каталог голосов Gemini") {
+                        Task { await viewModel.refreshGoogleTTSVoices() }
+                    }
                 }
 
                 Button("Пробный голос") {
@@ -549,6 +641,63 @@ struct CompanionSettingsView: View {
                                 viewModel.previewMotionGroup(motionGroup)
                             }
                             .buttonStyle(.bordered)
+                        }
+                    }
+                }
+
+                if viewModel.selectedModel.runtime == .vrm && !viewModel.availablePoses.isEmpty {
+                    Text("Позы (.vroidpose)")
+                        .font(.footnote.weight(.semibold))
+                        .foregroundStyle(.secondary)
+
+                    LazyVGrid(columns: [
+                        GridItem(.flexible(minimum: 120), spacing: 8),
+                        GridItem(.flexible(minimum: 120), spacing: 8)
+                    ], spacing: 8) {
+                        ForEach(viewModel.availablePoses) { pose in
+                            Button(pose.displayName) {
+                                viewModel.previewPose(pose)
+                            }
+                            .buttonStyle(.borderedProminent)
+                            .tint(.purple.opacity(0.75))
+                        }
+                    }
+                }
+
+                if viewModel.selectedModel.runtime == .vrm && !viewModel.availableVRMAAnimations.isEmpty {
+                    Text("VRM анимации (.vrma)")
+                        .font(.footnote.weight(.semibold))
+                        .foregroundStyle(.secondary)
+
+                    LazyVGrid(columns: [
+                        GridItem(.flexible(minimum: 120), spacing: 8),
+                        GridItem(.flexible(minimum: 120), spacing: 8)
+                    ], spacing: 8) {
+                        ForEach(viewModel.availableVRMAAnimations) { animation in
+                            Button(animation.displayName) {
+                                viewModel.previewVRMA(animation)
+                            }
+                            .buttonStyle(.borderedProminent)
+                            .tint(.teal.opacity(0.85))
+                        }
+                    }
+                }
+
+                if viewModel.selectedModel.runtime == .vrm {
+                    Text("Базовые VRM выражения")
+                        .font(.footnote.weight(.semibold))
+                        .foregroundStyle(.secondary)
+
+                    LazyVGrid(columns: [
+                        GridItem(.flexible(minimum: 120), spacing: 8),
+                        GridItem(.flexible(minimum: 120), spacing: 8)
+                    ], spacing: 8) {
+                        ForEach(CompanionVRMExpressionPreset.allCases) { expression in
+                            Button(expression.displayName) {
+                                viewModel.previewVRMExpression(expression)
+                            }
+                            .buttonStyle(.borderedProminent)
+                            .tint(.mint.opacity(0.85))
                         }
                     }
                 }

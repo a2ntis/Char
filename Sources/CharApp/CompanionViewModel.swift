@@ -11,6 +11,7 @@ final class CompanionViewModel: ObservableObject {
         static let profile = "companionProfile"
         static let voiceRepliesEnabled = "voiceRepliesEnabled"
         static let openAIAPIKey = "openAIAPIKey"
+        static let googleTTSAPIKey = "googleTTSAPIKey"
     }
 
     @Published var messages: [ChatMessage]
@@ -33,8 +34,13 @@ final class CompanionViewModel: ObservableObject {
     @Published var xttsReferencePathText: String
     @Published var openAITTSEndpointText: String
     @Published var openAITTSInstructionsText: String
+    @Published var googleTTSEndpointText: String
+    @Published var googleTTSStyleInstructionsText: String
     @Published var availablePiperVoices: [PiperVoiceOption] = []
     @Published var availableXTTSReferences: [XTTSReferenceOption] = []
+    @Published var availableGoogleTTSVoices: [GoogleTTSVoiceOption] = []
+    @Published var availableVRMAAnimations: [CompanionVRMAOption] = []
+    @Published var availablePoses: [CompanionPoseOption] = []
     @Published var isInstallingPiper = false
     @Published var ollamaEndpointText: String
     @Published var openAIEndpointText: String
@@ -44,6 +50,7 @@ final class CompanionViewModel: ObservableObject {
     @Published var availableLMStudioModels: [String] = []
     @Published var isRefreshingLLMModels = false
     @Published var openAIAPIKey: String
+    @Published var googleTTSAPIKey: String
     @Published var presenceState: CompanionPresenceState = .idle
     @Published var emotionState: CompanionEmotionState = .neutral
     @Published var isAvatarDragging = false
@@ -51,6 +58,9 @@ final class CompanionViewModel: ObservableObject {
     @Published var isManualPreviewMode = false
     @Published var manualExpressionRequest: CompanionExpressionRequest?
     @Published var manualMotionRequest: CompanionMotionRequest?
+    @Published var manualVRMARequest: CompanionVRMARequest?
+    @Published var manualPoseRequest: CompanionPoseRequest?
+    @Published var manualVRMExpressionRequest: CompanionVRMExpressionRequest?
 
     let speech = SpeechCoordinator()
 
@@ -64,13 +74,17 @@ final class CompanionViewModel: ObservableObject {
         profile = loadedProfile
         voiceRepliesEnabled = UserDefaults.standard.object(forKey: DefaultsKey.voiceRepliesEnabled) as? Bool ?? true
         openAIAPIKey = UserDefaults.standard.string(forKey: DefaultsKey.openAIAPIKey) ?? ""
+        googleTTSAPIKey = UserDefaults.standard.string(forKey: DefaultsKey.googleTTSAPIKey) ?? ""
 
         let assetsRoot = AppEnvironment.assetsRootURL
         let discoveredModels = ModelCatalog.discoverModels(in: assetsRoot)
         let fallbackModel = CompanionModelOption(
             id: assetsRoot.appendingPathComponent("shizuku/runtime").path,
             displayName: "Shizuku",
+            runtime: .live2d,
             assetRootPath: assetsRoot.appendingPathComponent("shizuku/runtime").path,
+            entryPath: assetsRoot.appendingPathComponent("shizuku/runtime/shizuku.model3.json").path,
+            technicalFormat: "Live2D Cubism",
             preset: CompanionModelPreset(passiveIdle: true),
             expressions: [],
             motionGroups: []
@@ -91,6 +105,8 @@ final class CompanionViewModel: ObservableObject {
         xttsReferencePathText = loadedProfile.xttsReferencePath
         openAITTSEndpointText = loadedProfile.openAITTSEndpoint.absoluteString
         openAITTSInstructionsText = loadedProfile.openAITTSInstructions
+        googleTTSEndpointText = loadedProfile.googleTTSEndpoint.absoluteString
+        googleTTSStyleInstructionsText = loadedProfile.googleTTSStyleInstructions
         ollamaEndpointText = loadedProfile.ollamaEndpoint.absoluteString
         openAIEndpointText = loadedProfile.openAIEndpoint.absoluteString
         lmStudioEndpointText = loadedProfile.lmStudioEndpoint.absoluteString
@@ -105,6 +121,9 @@ final class CompanionViewModel: ObservableObject {
         autofillXTTSPaths()
         refreshPiperVoices()
         refreshXTTSReferences()
+        refreshVRMAAnimations()
+        refreshPoses()
+        Task { await refreshGoogleTTSVoices() }
         bindPresence()
     }
 
@@ -187,6 +206,8 @@ final class CompanionViewModel: ObservableObject {
         profile.ttsProvider = provider
         if provider == .openAI {
             normalizeOpenAITTSSelection()
+        } else if provider == .gemini {
+            normalizeGoogleTTSSelection()
         }
         status = ""
         persistProfile()
@@ -224,6 +245,62 @@ final class CompanionViewModel: ObservableObject {
         let trimmed = endpointString.trimmingCharacters(in: .whitespacesAndNewlines)
         guard let url = URL(string: trimmed), !trimmed.isEmpty else { return }
         profile.openAITTSEndpoint = url
+        status = ""
+        persistProfile()
+    }
+
+    func setGoogleTTSAPIKey(_ key: String) {
+        googleTTSAPIKey = key
+        UserDefaults.standard.set(key, forKey: DefaultsKey.googleTTSAPIKey)
+    }
+
+    func setGoogleTTSEndpoint(_ endpointString: String) {
+        googleTTSEndpointText = endpointString
+        let trimmed = endpointString.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard let url = URL(string: trimmed), !trimmed.isEmpty else { return }
+        profile.googleTTSEndpoint = url
+        status = ""
+        persistProfile()
+    }
+
+    func setGoogleTTSModel(_ model: String) {
+        profile.googleTTSModel = model
+        status = ""
+        persistProfile()
+    }
+
+    func setGoogleTTSLanguageCode(_ languageCode: String) {
+        profile.googleTTSLanguageCode = languageCode
+        normalizeGoogleTTSSelection()
+        status = ""
+        persistProfile()
+    }
+
+    func setGoogleTTSVoiceName(_ name: String) {
+        profile.googleTTSVoiceName = name
+        if let selected = availableGoogleTTSVoices.first(where: { $0.name == name }),
+           let firstLanguage = selected.languageCodes.first {
+            profile.googleTTSLanguageCode = firstLanguage
+        }
+        status = ""
+        persistProfile()
+    }
+
+    func setGoogleTTSSpeakingRate(_ rate: Double) {
+        profile.googleTTSSpeakingRate = min(max(rate, 0.25), 4.0)
+        status = ""
+        persistProfile()
+    }
+
+    func setGoogleTTSPitch(_ pitch: Double) {
+        profile.googleTTSPitch = min(max(pitch, -20.0), 20.0)
+        status = ""
+        persistProfile()
+    }
+
+    func setGoogleTTSStyleInstructions(_ instructions: String) {
+        googleTTSStyleInstructionsText = instructions
+        profile.googleTTSStyleInstructions = instructions
         status = ""
         persistProfile()
     }
@@ -483,6 +560,22 @@ final class CompanionViewModel: ObservableObject {
         return "OpenAI TTS использует тот же API key, что и чат OpenAI."
     }
 
+    var googleTTSStatusSummary: String {
+        if googleTTSAPIKey.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+            return "Для Gemini TTS нужен Gemini API key."
+        }
+
+        if availableGoogleTTSVoices.isEmpty {
+            return "Каталог голосов Gemini еще не загружен."
+        }
+
+        return "Gemini TTS готов. Доступно голосов: \(availableGoogleTTSVoices.count)."
+    }
+
+    var filteredGoogleTTSVoices: [GoogleTTSVoiceOption] {
+        availableGoogleTTSVoices
+    }
+
     func refreshXTTSReferences() {
         let directory = profile.xttsReferencesDirectory.trimmingCharacters(in: .whitespacesAndNewlines)
         if !directory.isEmpty {
@@ -527,6 +620,21 @@ final class CompanionViewModel: ObservableObject {
             profile.piperModelPath = first.modelPath
             piperModelPathText = first.modelPath
             persistProfile()
+        }
+    }
+
+    func refreshGoogleTTSVoices() async {
+        do {
+            let voices = try await client.listGoogleTTSVoices(endpoint: profile.googleTTSEndpoint, apiKey: googleTTSAPIKey)
+            availableGoogleTTSVoices = voices
+            normalizeGoogleTTSSelection()
+            if !googleTTSAPIKey.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+                status = "Gemini TTS: каталог голосов обновлен."
+            }
+            persistProfile()
+        } catch {
+            availableGoogleTTSVoices = []
+            status = error.localizedDescription
         }
     }
 
@@ -731,6 +839,37 @@ final class CompanionViewModel: ObservableObject {
         manualMotionRequest = CompanionMotionRequest(groupName: motionGroup.groupName)
     }
 
+    func previewVRMA(_ animation: CompanionVRMAOption) {
+        isManualPreviewMode = true
+        manualPoseRequest = nil
+        manualVRMARequest = CompanionVRMARequest(
+            label: animation.displayName,
+            filePath: animation.filePath
+        )
+    }
+
+    func previewPose(_ pose: CompanionPoseOption) {
+        isManualPreviewMode = true
+        manualVRMARequest = nil
+        manualPoseRequest = CompanionPoseRequest(
+            label: pose.displayName,
+            filePath: pose.filePath
+        )
+    }
+
+    func previewVRMExpression(_ expression: CompanionVRMExpressionPreset?) {
+        emotionResetTask?.cancel()
+        isManualPreviewMode = expression != nil
+        manualEmotionOverride = nil
+        manualExpressionRequest = nil
+        manualMotionRequest = nil
+        manualVRMARequest = nil
+        manualPoseRequest = nil
+        manualVRMExpressionRequest = expression.map {
+            CompanionVRMExpressionRequest(expression: $0)
+        }
+    }
+
     func clearManualPreview() {
         emotionResetTask?.cancel()
         isManualPreviewMode = false
@@ -738,6 +877,17 @@ final class CompanionViewModel: ObservableObject {
         emotionState = .neutral
         manualExpressionRequest = nil
         manualMotionRequest = nil
+        manualVRMARequest = nil
+        manualPoseRequest = nil
+        manualVRMExpressionRequest = nil
+    }
+
+    func refreshVRMAAnimations() {
+        availableVRMAAnimations = VRMACatalog.discover(in: AppEnvironment.assetsRootURL)
+    }
+
+    func refreshPoses() {
+        availablePoses = PoseCatalog.discover(in: AppEnvironment.assetsRootURL)
     }
 
     private func bindPresence() {
@@ -869,6 +1019,10 @@ final class CompanionViewModel: ObservableObject {
             updated.openAITTSEndpoint = URL(string: "https://api.openai.com/v1/audio/speech")!
         }
 
+        if updated.googleTTSEndpoint.absoluteString.isEmpty {
+            updated.googleTTSEndpoint = URL(string: "https://generativelanguage.googleapis.com/v1beta")!
+        }
+
         return updated
     }
 
@@ -876,6 +1030,13 @@ final class CompanionViewModel: ObservableObject {
         let availableVoices = OpenAITTSCatalog.voices(for: profile.openAITTSModel)
         if !availableVoices.contains(profile.openAITTSVoice), let first = availableVoices.first {
             profile.openAITTSVoice = first
+        }
+    }
+
+    private func normalizeGoogleTTSSelection() {
+        let matches = filteredGoogleTTSVoices
+        if !matches.contains(where: { $0.name == profile.googleTTSVoiceName }), let first = matches.first {
+            profile.googleTTSVoiceName = first.name
         }
     }
 
@@ -976,4 +1137,21 @@ struct CompanionExpressionRequest: Identifiable, Equatable {
 struct CompanionMotionRequest: Identifiable, Equatable {
     let id = UUID()
     let groupName: String
+}
+
+struct CompanionVRMARequest: Identifiable, Equatable {
+    let id = UUID()
+    let label: String
+    let filePath: String
+}
+
+struct CompanionPoseRequest: Identifiable, Equatable {
+    let id = UUID()
+    let label: String
+    let filePath: String
+}
+
+struct CompanionVRMExpressionRequest: Identifiable, Equatable {
+    let id = UUID()
+    let expression: CompanionVRMExpressionPreset
 }

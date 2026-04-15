@@ -25,6 +25,7 @@ enum CompanionTTSProvider: String, CaseIterable, Codable, Hashable, Identifiable
     case piper
     case xtts
     case openAI
+    case gemini
 
     var id: String { rawValue }
 
@@ -38,8 +39,58 @@ enum CompanionTTSProvider: String, CaseIterable, Codable, Hashable, Identifiable
             return "XTTS v2 (локально)"
         case .openAI:
             return "OpenAI TTS"
+        case .gemini:
+            return "Gemini TTS"
         }
     }
+}
+
+struct GoogleTTSVoiceOption: Identifiable, Hashable {
+    let id: String
+    let displayName: String
+    let name: String
+    let languageCodes: [String]
+}
+
+enum GeminiTTSCatalog {
+    static let supportedModels: [String] = [
+        "gemini-2.5-flash-lite-preview-tts",
+        "gemini-2.5-flash-preview-tts",
+        "gemini-2.5-pro-preview-tts",
+    ]
+
+    static let voices: [GoogleTTSVoiceOption] = [
+        .init(id: "Zephyr", displayName: "Zephyr — Bright", name: "Zephyr", languageCodes: ["auto"]),
+        .init(id: "Puck", displayName: "Puck — Upbeat", name: "Puck", languageCodes: ["auto"]),
+        .init(id: "Charon", displayName: "Charon — Informative", name: "Charon", languageCodes: ["auto"]),
+        .init(id: "Kore", displayName: "Kore — Firm", name: "Kore", languageCodes: ["auto"]),
+        .init(id: "Fenrir", displayName: "Fenrir — Excitable", name: "Fenrir", languageCodes: ["auto"]),
+        .init(id: "Leda", displayName: "Leda — Youthful", name: "Leda", languageCodes: ["auto"]),
+        .init(id: "Orus", displayName: "Orus — Firm", name: "Orus", languageCodes: ["auto"]),
+        .init(id: "Aoede", displayName: "Aoede — Breezy", name: "Aoede", languageCodes: ["auto"]),
+        .init(id: "Callirrhoe", displayName: "Callirrhoe — Easy-going", name: "Callirrhoe", languageCodes: ["auto"]),
+        .init(id: "Autonoe", displayName: "Autonoe — Bright", name: "Autonoe", languageCodes: ["auto"]),
+        .init(id: "Enceladus", displayName: "Enceladus — Breathy", name: "Enceladus", languageCodes: ["auto"]),
+        .init(id: "Iapetus", displayName: "Iapetus — Clear", name: "Iapetus", languageCodes: ["auto"]),
+        .init(id: "Umbriel", displayName: "Umbriel — Easy-going", name: "Umbriel", languageCodes: ["auto"]),
+        .init(id: "Algieba", displayName: "Algieba — Smooth", name: "Algieba", languageCodes: ["auto"]),
+        .init(id: "Despina", displayName: "Despina — Smooth", name: "Despina", languageCodes: ["auto"]),
+        .init(id: "Erinome", displayName: "Erinome — Clear", name: "Erinome", languageCodes: ["auto"]),
+        .init(id: "Algenib", displayName: "Algenib — Gravelly", name: "Algenib", languageCodes: ["auto"]),
+        .init(id: "Rasalgethi", displayName: "Rasalgethi — Informative", name: "Rasalgethi", languageCodes: ["auto"]),
+        .init(id: "Laomedeia", displayName: "Laomedeia — Upbeat", name: "Laomedeia", languageCodes: ["auto"]),
+        .init(id: "Achernar", displayName: "Achernar — Soft", name: "Achernar", languageCodes: ["auto"]),
+        .init(id: "Alnilam", displayName: "Alnilam — Firm", name: "Alnilam", languageCodes: ["auto"]),
+        .init(id: "Schedar", displayName: "Schedar — Even", name: "Schedar", languageCodes: ["auto"]),
+        .init(id: "Gacrux", displayName: "Gacrux — Mature", name: "Gacrux", languageCodes: ["auto"]),
+        .init(id: "Pulcherrima", displayName: "Pulcherrima — Forward", name: "Pulcherrima", languageCodes: ["auto"]),
+        .init(id: "Achird", displayName: "Achird — Friendly", name: "Achird", languageCodes: ["auto"]),
+        .init(id: "Zubenelgenubi", displayName: "Zubenelgenubi — Casual", name: "Zubenelgenubi", languageCodes: ["auto"]),
+        .init(id: "Vindemiatrix", displayName: "Vindemiatrix — Gentle", name: "Vindemiatrix", languageCodes: ["auto"]),
+        .init(id: "Sadachbia", displayName: "Sadachbia — Lively", name: "Sadachbia", languageCodes: ["auto"]),
+        .init(id: "Sadaltager", displayName: "Sadaltager — Knowledgeable", name: "Sadaltager", languageCodes: ["auto"]),
+        .init(id: "Sulafat", displayName: "Sulafat — Warm", name: "Sulafat", languageCodes: ["auto"]),
+    ]
 }
 
 enum OpenAITTSCatalog {
@@ -149,6 +200,13 @@ struct CompanionProfile: Codable, Hashable {
     var openAITTSSpeed: Double = 0.96
     var openAITTSInstructions: String = "Speak in a soft, friendly, conversational tone with a light feminine feel. Keep the delivery warm and natural, not robotic."
     var openAITTSEndpoint: URL = URL(string: "https://api.openai.com/v1/audio/speech")!
+    var googleTTSEndpoint: URL = URL(string: "https://generativelanguage.googleapis.com/v1beta")!
+    var googleTTSModel: String = "gemini-2.5-flash-lite-preview-tts"
+    var googleTTSLanguageCode: String = "ru-RU"
+    var googleTTSVoiceName: String = "Leda"
+    var googleTTSSpeakingRate: Double = 0.96
+    var googleTTSPitch: Double = 2.0
+    var googleTTSStyleInstructions: String = "Speak in a soft, light, feminine, warm, conversational tone. Sound gentle, youthful, and natural. Avoid a robotic or announcer-like delivery."
     var provider: CompanionLLMProvider = .ollama
     var ollamaModel: String = "qwen3:14b"
     var ollamaEndpoint: URL = URL(string: "http://127.0.0.1:11434/api/chat")!
@@ -221,6 +279,13 @@ struct CompanionProfile: Codable, Hashable {
         case openAITTSSpeed
         case openAITTSInstructions
         case openAITTSEndpoint
+        case googleTTSEndpoint
+        case googleTTSModel
+        case googleTTSLanguageCode
+        case googleTTSVoiceName
+        case googleTTSSpeakingRate
+        case googleTTSPitch
+        case googleTTSStyleInstructions
         case provider
         case ollamaModel
         case ollamaEndpoint
@@ -254,6 +319,13 @@ struct CompanionProfile: Codable, Hashable {
         openAITTSSpeed = try container.decodeIfPresent(Double.self, forKey: .openAITTSSpeed) ?? 0.96
         openAITTSInstructions = try container.decodeIfPresent(String.self, forKey: .openAITTSInstructions) ?? "Speak in a soft, friendly, conversational tone with a light feminine feel. Keep the delivery warm and natural, not robotic."
         openAITTSEndpoint = try container.decodeIfPresent(URL.self, forKey: .openAITTSEndpoint) ?? URL(string: "https://api.openai.com/v1/audio/speech")!
+        googleTTSEndpoint = try container.decodeIfPresent(URL.self, forKey: .googleTTSEndpoint) ?? URL(string: "https://generativelanguage.googleapis.com/v1beta")!
+        googleTTSModel = try container.decodeIfPresent(String.self, forKey: .googleTTSModel) ?? "gemini-2.5-flash-lite-preview-tts"
+        googleTTSLanguageCode = try container.decodeIfPresent(String.self, forKey: .googleTTSLanguageCode) ?? "ru-RU"
+        googleTTSVoiceName = try container.decodeIfPresent(String.self, forKey: .googleTTSVoiceName) ?? "Leda"
+        googleTTSSpeakingRate = try container.decodeIfPresent(Double.self, forKey: .googleTTSSpeakingRate) ?? 0.96
+        googleTTSPitch = try container.decodeIfPresent(Double.self, forKey: .googleTTSPitch) ?? 2.0
+        googleTTSStyleInstructions = try container.decodeIfPresent(String.self, forKey: .googleTTSStyleInstructions) ?? "Speak in a soft, light, feminine, warm, conversational tone. Sound gentle, youthful, and natural. Avoid a robotic or announcer-like delivery."
         provider = try container.decodeIfPresent(CompanionLLMProvider.self, forKey: .provider) ?? .ollama
         ollamaModel = try container.decodeIfPresent(String.self, forKey: .ollamaModel) ?? "qwen3:14b"
         ollamaEndpoint = try container.decodeIfPresent(URL.self, forKey: .ollamaEndpoint) ?? URL(string: "http://127.0.0.1:11434/api/chat")!
@@ -276,13 +348,47 @@ struct XTTSReferenceOption: Identifiable, Hashable {
     let filePath: String
 }
 
+enum CompanionAvatarRuntime: String, Hashable, Codable {
+    case live2d
+    case vrm
+    case vroidProject
+
+    var displayName: String {
+        switch self {
+        case .live2d:
+            return "Live2D"
+        case .vrm:
+            return "VRM"
+        case .vroidProject:
+            return "VRoid"
+        }
+    }
+
+    var supportsRendering: Bool {
+        switch self {
+        case .live2d, .vrm:
+            return true
+        case .vroidProject:
+            return false
+        }
+    }
+}
+
 struct CompanionModelOption: Identifiable, Hashable {
     let id: String
     let displayName: String
+    let runtime: CompanionAvatarRuntime
     let assetRootPath: String
+    let entryPath: String
+    let technicalFormat: String?
     let preset: CompanionModelPreset
     let expressions: [CompanionExpressionOption]
     let motionGroups: [CompanionMotionGroupOption]
+
+    var isVRM0x: Bool {
+        guard runtime == .vrm, let fmt = technicalFormat else { return false }
+        return fmt.contains("0.x") || fmt == "VRM"
+    }
 }
 
 struct CompanionExpressionOption: Identifiable, Hashable {
@@ -313,6 +419,48 @@ struct CompanionQuickExpressionButton: Hashable, Decodable, Identifiable {
 }
 
 enum ModelCatalog {
+    private static func detectVRMFormat(at fileURL: URL) -> String? {
+        guard let data = try? Data(contentsOf: fileURL), data.count > 24 else {
+            return nil
+        }
+
+        func littleEndianUInt32(at offset: Int) -> UInt32? {
+            guard data.count >= offset + 4 else { return nil }
+            return data.subdata(in: offset..<(offset + 4)).withUnsafeBytes { rawBuffer in
+                rawBuffer.load(as: UInt32.self).littleEndian
+            }
+        }
+
+        guard let jsonLength = littleEndianUInt32(at: 12),
+              let chunkTypeData = "JSON".data(using: .utf8),
+              data.subdata(in: 16..<20) == chunkTypeData else {
+            return nil
+        }
+
+        let jsonStart = 20
+        let jsonEnd = jsonStart + Int(jsonLength)
+        guard jsonEnd <= data.count else {
+            return nil
+        }
+
+        guard let object = try? JSONSerialization.jsonObject(with: data.subdata(in: jsonStart..<jsonEnd)) as? [String: Any] else {
+            return nil
+        }
+
+        if let extensions = object["extensions"] as? [String: Any],
+           let vrmcVRM = extensions["VRMC_vrm"] as? [String: Any],
+           let specVersion = vrmcVRM["specVersion"] as? String {
+            return "VRM \(specVersion)"
+        }
+
+        if let extensions = object["extensions"] as? [String: Any],
+           extensions["VRM"] != nil {
+            return "VRM 0.x"
+        }
+
+        return "VRM"
+    }
+
     private struct Model3JSON: Decodable {
         struct FileReferences: Decodable {
             struct MotionEntry: Decodable {
@@ -452,33 +600,79 @@ enum ModelCatalog {
         }
 
         var models: [CompanionModelOption] = []
+        var vrmBaseNames: Set<String> = []
+
+        if let vrmEnumerator = fileManager.enumerator(
+            at: assetsRoot,
+            includingPropertiesForKeys: nil,
+            options: [.skipsHiddenFiles]
+        ) {
+            for case let fileURL as URL in vrmEnumerator {
+                guard fileURL.pathExtension.lowercased() == "vrm" else { continue }
+                vrmBaseNames.insert(fileURL.deletingPathExtension().lastPathComponent.lowercased())
+            }
+        }
 
         for case let fileURL as URL in enumerator {
-            guard fileURL.pathExtension == "json", fileURL.lastPathComponent.hasSuffix(".model3.json") else {
+            if fileURL.pathExtension == "json", fileURL.lastPathComponent.hasSuffix(".model3.json") {
+                let assetRoot = fileURL.deletingLastPathComponent()
+                let displayBase: String
+                if assetRoot.lastPathComponent == "runtime" {
+                    displayBase = assetRoot.deletingLastPathComponent().lastPathComponent
+                } else {
+                    displayBase = assetRoot.lastPathComponent
+                }
+
+                let displayName = displayBase
+                    .replacingOccurrences(of: "_", with: " ")
+                    .replacingOccurrences(of: "-", with: " ")
+                    .capitalized
+
+                models.append(
+                    CompanionModelOption(
+                        id: assetRoot.path,
+                        displayName: displayName,
+                        runtime: .live2d,
+                        assetRootPath: assetRoot.path,
+                        entryPath: fileURL.path,
+                        technicalFormat: "Live2D Cubism",
+                        preset: loadPreset(for: assetRoot),
+                        expressions: discoverExpressions(assetRoot: assetRoot, modelFileURL: fileURL),
+                        motionGroups: discoverMotionGroups(modelFileURL: fileURL)
+                    )
+                )
+                continue
+            }
+
+            let lowercasedPathExtension = fileURL.pathExtension.lowercased()
+            guard lowercasedPathExtension == "vrm" || lowercasedPathExtension == "vroid" else {
+                continue
+            }
+
+            let baseName = fileURL.deletingPathExtension().lastPathComponent
+            if lowercasedPathExtension == "vroid", vrmBaseNames.contains(baseName.lowercased()) {
                 continue
             }
 
             let assetRoot = fileURL.deletingLastPathComponent()
-            let displayBase: String
-            if assetRoot.lastPathComponent == "runtime" {
-                displayBase = assetRoot.deletingLastPathComponent().lastPathComponent
-            } else {
-                displayBase = assetRoot.lastPathComponent
-            }
-
-            let displayName = displayBase
+            let runtime = lowercasedPathExtension == "vrm" ? CompanionAvatarRuntime.vrm : CompanionAvatarRuntime.vroidProject
+            let technicalFormat = runtime == .vrm ? detectVRMFormat(at: fileURL) : "VRoid Project"
+            let displayName = fileURL.deletingPathExtension().lastPathComponent
                 .replacingOccurrences(of: "_", with: " ")
                 .replacingOccurrences(of: "-", with: " ")
-                .capitalized
+                .capitalized + " (\(technicalFormat ?? runtime.displayName))"
 
             models.append(
                 CompanionModelOption(
-                    id: assetRoot.path,
+                    id: fileURL.path,
                     displayName: displayName,
+                    runtime: runtime,
                     assetRootPath: assetRoot.path,
+                    entryPath: fileURL.path,
+                    technicalFormat: technicalFormat,
                     preset: loadPreset(for: assetRoot),
-                    expressions: discoverExpressions(assetRoot: assetRoot, modelFileURL: fileURL),
-                    motionGroups: discoverMotionGroups(modelFileURL: fileURL)
+                    expressions: [],
+                    motionGroups: []
                 )
             )
         }
@@ -507,6 +701,34 @@ enum CompanionEmotionState: Int {
     case thinking = 4
     case sleepy = 5
     case angry = 6
+}
+
+enum CompanionVRMExpressionPreset: String, CaseIterable, Identifiable, Hashable {
+    case neutral
+    case smiling
+    case sad
+    case angry
+    case happy
+    case surprised
+
+    var id: String { rawValue }
+
+    var displayName: String {
+        switch self {
+        case .neutral:
+            return "Neutral"
+        case .smiling:
+            return "Smiling"
+        case .sad:
+            return "Sad"
+        case .angry:
+            return "Angry"
+        case .happy:
+            return "Happy"
+        case .surprised:
+            return "Surprised"
+        }
+    }
 }
 
 struct OllamaChatRequest: Encodable {
