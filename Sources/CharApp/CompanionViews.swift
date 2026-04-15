@@ -1040,8 +1040,10 @@ final class CompanionVRMRealityView: ARView {
     }
 
     private func updateCameraTransform() {
-        let position = orbitTarget + SIMD3<Float>(0, 0, orbitDistance)
-        cameraEntity.look(at: orbitTarget, from: position, relativeTo: nil)
+        let cameraLift: Float = orbitDistance * 0.22
+        let adjustedTarget = orbitTarget + SIMD3<Float>(0, cameraLift * 0.28, 0)
+        let position = adjustedTarget + SIMD3<Float>(0, cameraLift * 0.72, orbitDistance)
+        cameraEntity.look(at: adjustedTarget, from: position, relativeTo: nil)
     }
 
     private func scheduleNextBlink() {
@@ -1195,7 +1197,7 @@ final class CompanionVRMRealityView: ARView {
         }
 
         let lookYawTarget = clampedX * 0.22 * lookStateScale
-        let lookPitchTarget = clampedY * 0.12 * lookStateScale
+        let lookPitchTarget = -clampedY * 0.12 * lookStateScale
         let lookSmoothing = Float(1 - exp(-Double(7.5) * deltaTime))
         lookYawCurrent += (lookYawTarget - lookYawCurrent) * lookSmoothing
         lookPitchCurrent += (lookPitchTarget - lookPitchCurrent) * lookSmoothing
@@ -1210,63 +1212,20 @@ final class CompanionVRMRealityView: ARView {
         dragRollCurrent += (dragRollTarget - dragRollCurrent) * dragSmoothing
         dragPitchCurrent += (dragPitchTarget - dragPitchCurrent) * dragSmoothing
 
-        let breatheScale: Float
-        let swayScale: Float
-        switch presenceState {
-        case .thinking:
-            breatheScale = 0.010
-            swayScale = 0.020
-        case .listening:
-            breatheScale = 0.008
-            swayScale = 0.014
-        case .speaking:
-            breatheScale = 0.006
-            swayScale = 0.010
-        case .idle:
-            breatheScale = 0.012
-            swayScale = 0.024
-        }
-
-        let breatheY = sin(Float(motionTime) * 1.7) * breatheScale
-        let chestPitch = sin(Float(motionTime) * 1.3 + 0.6) * 0.014
-        let bodyYaw = sin(Float(motionTime) * 0.9 + 1.2) * swayScale
-        let bodyRoll = sin(Float(motionTime) * 1.1 + 2.0) * swayScale * 0.55
-        let headMicroRoll = sin(Float(motionTime) * 1.8 + 0.5) * 0.018
         let thinkingTilt: Float = presenceState == .thinking ? -0.12 : 0
-        let listeningLean: Float = presenceState == .listening ? -0.03 : 0
 
-        let rootYaw = bodyYaw + dragYawCurrent
-        let rootRoll = bodyRoll + dragRollCurrent
-        let rootPitch = listeningLean + dragPitchCurrent
-
-        vrmEntity.entity.transform.translation = rootBasePosition + SIMD3<Float>(0, breatheY, 0)
+        vrmEntity.entity.transform.translation = rootBasePosition
         vrmEntity.entity.transform.rotation =
             rootBaseRotation
-            * simd_quatf(angle: rootYaw, axis: SIMD3<Float>(0, 1, 0))
-            * simd_quatf(angle: rootPitch, axis: SIMD3<Float>(1, 0, 0))
-            * simd_quatf(angle: rootRoll, axis: SIMD3<Float>(0, 0, 1))
-
-        if let spineEntity {
-            spineEntity.transform.rotation =
-                spineBaseRotation
-                * simd_quatf(angle: chestPitch * 0.45, axis: SIMD3<Float>(1, 0, 0))
-                * simd_quatf(angle: bodyYaw * 0.18, axis: SIMD3<Float>(0, 1, 0))
-        }
-
-        if let chestEntity {
-            chestEntity.transform.rotation =
-                chestBaseRotation
-                * simd_quatf(angle: chestPitch, axis: SIMD3<Float>(1, 0, 0))
-                * simd_quatf(angle: bodyYaw * 0.22, axis: SIMD3<Float>(0, 1, 0))
-                * simd_quatf(angle: bodyRoll * 0.35, axis: SIMD3<Float>(0, 0, 1))
-        }
+            * simd_quatf(angle: dragYawCurrent, axis: SIMD3<Float>(0, 1, 0))
+            * simd_quatf(angle: dragPitchCurrent, axis: SIMD3<Float>(1, 0, 0))
+            * simd_quatf(angle: dragRollCurrent, axis: SIMD3<Float>(0, 0, 1))
 
         if let neckEntity {
             neckEntity.transform.rotation =
                 neckBaseRotation
                 * simd_quatf(angle: lookYawCurrent * 0.45, axis: SIMD3<Float>(0, 1, 0))
                 * simd_quatf(angle: lookPitchCurrent * 0.55 + thinkingTilt * 0.35, axis: SIMD3<Float>(1, 0, 0))
-                * simd_quatf(angle: headMicroRoll * 0.45, axis: SIMD3<Float>(0, 0, 1))
         }
 
         if let headEntity {
@@ -1274,7 +1233,7 @@ final class CompanionVRMRealityView: ARView {
                 headBaseRotation
                 * simd_quatf(angle: lookYawCurrent, axis: SIMD3<Float>(0, 1, 0))
                 * simd_quatf(angle: lookPitchCurrent + thinkingTilt, axis: SIMD3<Float>(1, 0, 0))
-                * simd_quatf(angle: headMicroRoll + dragRollCurrent * 0.25, axis: SIMD3<Float>(0, 0, 1))
+                * simd_quatf(angle: dragRollCurrent * 0.25, axis: SIMD3<Float>(0, 0, 1))
         }
     }
 

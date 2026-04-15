@@ -898,3 +898,4 @@ final class VRoidPosePlayer {
         return first.lowercased() + pascalCase.dropFirst()
     }
 }
+
