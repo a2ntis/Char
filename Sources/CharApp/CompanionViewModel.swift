@@ -40,6 +40,7 @@ final class CompanionViewModel: ObservableObject {
     @Published var availableXTTSReferences: [XTTSReferenceOption] = []
     @Published var availableGoogleTTSVoices: [GoogleTTSVoiceOption] = []
     @Published var availableVRMAAnimations: [CompanionVRMAOption] = []
+    @Published var availableBVHAnimations: [CompanionBVHOption] = []
     @Published var availablePoses: [CompanionPoseOption] = []
     @Published var isInstallingPiper = false
     @Published var ollamaEndpointText: String
@@ -122,6 +123,7 @@ final class CompanionViewModel: ObservableObject {
         refreshPiperVoices()
         refreshXTTSReferences()
         refreshVRMAAnimations()
+        refreshBVHAnimations()
         refreshPoses()
         Task { await refreshGoogleTTSVoices() }
         bindPresence()
@@ -884,6 +886,31 @@ final class CompanionViewModel: ObservableObject {
 
     func refreshVRMAAnimations() {
         availableVRMAAnimations = VRMACatalog.discover(in: AppEnvironment.assetsRootURL)
+    }
+
+    func refreshBVHAnimations() {
+        availableBVHAnimations = BVHCatalog.discover(in: AppEnvironment.assetsRootURL)
+    }
+
+    func previewBVH(_ animation: CompanionBVHOption) {
+        isManualPreviewMode = true
+        Task.detached(priority: .userInitiated) { [weak self, animation] in
+            do {
+                let vrmaPath = try BVHConverter.vrmaPath(for: animation.filePath)
+                await MainActor.run {
+                    guard let self else { return }
+                    self.manualPoseRequest = nil
+                    self.manualVRMARequest = CompanionVRMARequest(
+                        label: animation.displayName,
+                        filePath: vrmaPath
+                    )
+                }
+            } catch {
+                await MainActor.run { [weak self] in
+                    self?.status = "BVH convert error: \(error.localizedDescription)"
+                }
+            }
+        }
     }
 
     func refreshPoses() {

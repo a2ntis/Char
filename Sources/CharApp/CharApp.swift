@@ -683,6 +683,25 @@ struct CompanionSettingsView: View {
                     }
                 }
 
+                if viewModel.selectedModel.runtime == .vrm && !viewModel.availableBVHAnimations.isEmpty {
+                    Text("BVH анимации (.bvh)")
+                        .font(.footnote.weight(.semibold))
+                        .foregroundStyle(.secondary)
+
+                    LazyVGrid(columns: [
+                        GridItem(.flexible(minimum: 120), spacing: 8),
+                        GridItem(.flexible(minimum: 120), spacing: 8)
+                    ], spacing: 8) {
+                        ForEach(viewModel.availableBVHAnimations) { animation in
+                            Button(animation.displayName) {
+                                viewModel.previewBVH(animation)
+                            }
+                            .buttonStyle(.borderedProminent)
+                            .tint(.cyan.opacity(0.85))
+                        }
+                    }
+                }
+
                 if viewModel.selectedModel.runtime == .vrm {
                     Text("Базовые VRM выражения")
                         .font(.footnote.weight(.semibold))
