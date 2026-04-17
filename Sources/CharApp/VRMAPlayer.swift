@@ -26,9 +26,10 @@ enum PoseCatalog {
             return []
         }
 
+        let allowed: Set<String> = ["vroidpose", "vrma"]
         return enumerator
             .compactMap { $0 as? URL }
-            .filter { $0.pathExtension.lowercased() == "vroidpose" }
+            .filter { allowed.contains($0.pathExtension.lowercased()) }
             .sorted { $0.lastPathComponent.localizedCaseInsensitiveCompare($1.lastPathComponent) == .orderedAscending }
             .map {
                 CompanionPoseOption(
@@ -182,6 +183,10 @@ private struct VRMAClip {
     let duration: Float
     let channels: [VRMAChannel]
     let sourceHipsRestPosition: SIMD3<Float>
+    /// Per-bone LOCAL source-skeleton rest rotation (from the VRMA node's static rotation field).
+    let localSourceRest: [String: simd_quatf]
+    /// Per-bone WORLD-SPACE source-skeleton rest rotation (accumulated chain product from hips to bone).
+    let worldSourceRest: [String: simd_quatf]
 }
 
 // MARK: - VRMAPlayer
@@ -190,10 +195,8 @@ private struct VRMAClip {
 final class VRMAPlayer {
     private let clip: VRMAClip
     private weak var vrmEntity: VRMEntity?
-    private let convention: VRMCoordinateConvention
 
     private var currentTime: Float = 0
-
     private var boneRestTransforms: [Humanoid.Bones: Transform]
     private var chestEntity: Entity?
     private var chestRestTransform: Transform?
@@ -202,8 +205,89 @@ final class VRMAPlayer {
     private let blendOutDuration: Float = 0.35
     private var restGroundY: Float?
 
-    private static let faceBoneNames: Set<String> = [
+    /// World-space rest rotation of each target VRM bone (accumulated chain product).
+    private var worldTargetRest: [String: simd_quatf] = [:]
+
+    static let faceBoneNames: Set<String> = [
         "leftEye", "rightEye", "jaw",
+    ]
+
+    // MARK: - VRM Humanoid bone hierarchy
+
+    /// Parent bone name for each humanoid bone (root "hips" has no entry).
+    static let boneParent: [String: String] = {
+        var d: [String: String] = [:]
+        // Spine chain
+        for (child, parent) in [("spine","hips"),("chest","spine"),("upperChest","chest"),
+                                 ("neck","upperChest"),("head","neck"),
+                                 ("jaw","head"),("leftEye","head"),("rightEye","head")] {
+            d[child] = parent
+        }
+        // Left arm
+        for (child, parent) in [("leftShoulder","upperChest"),("leftUpperArm","leftShoulder"),
+                                 ("leftLowerArm","leftUpperArm"),("leftHand","leftLowerArm")] {
+            d[child] = parent
+        }
+        // Right arm
+        for (child, parent) in [("rightShoulder","upperChest"),("rightUpperArm","rightShoulder"),
+                                 ("rightLowerArm","rightUpperArm"),("rightHand","rightLowerArm")] {
+            d[child] = parent
+        }
+        // Fingers
+        for side in ["left", "right"] {
+            let hand = "\(side)Hand"
+            for finger in ["Thumb","Index","Middle","Ring","Little"] {
+                let segments: [(String, String)]
+                if finger == "Thumb" {
+                    segments = [("Metacarpal", hand), ("Proximal", "\(side)\(finger)Metacarpal"),
+                                ("Distal", "\(side)\(finger)Proximal")]
+                } else {
+                    segments = [("Proximal", hand), ("Intermediate", "\(side)\(finger)Proximal"),
+                                ("Distal", "\(side)\(finger)Intermediate")]
+                }
+                for (seg, par) in segments {
+                    d["\(side)\(finger)\(seg)"] = par
+                }
+            }
+        }
+        // Legs
+        for (child, parent) in [("leftUpperLeg","hips"),("leftLowerLeg","leftUpperLeg"),
+                                 ("leftFoot","leftLowerLeg"),("leftToes","leftFoot"),
+                                 ("rightUpperLeg","hips"),("rightLowerLeg","rightUpperLeg"),
+                                 ("rightFoot","rightLowerLeg"),("rightToes","rightFoot")] {
+            d[child] = parent
+        }
+        return d
+    }()
+
+    /// All humanoid bone names in breadth-first (root-first) traversal order.
+    static let boneHierarchyOrder: [String] = [
+        "hips",
+        "spine", "chest", "upperChest",
+        "neck", "head", "jaw", "leftEye", "rightEye",
+        "leftShoulder", "rightShoulder",
+        "leftUpperArm", "rightUpperArm",
+        "leftLowerArm", "rightLowerArm",
+        "leftHand", "rightHand",
+        "leftThumbMetacarpal", "rightThumbMetacarpal",
+        "leftThumbProximal",   "rightThumbProximal",
+        "leftThumbDistal",     "rightThumbDistal",
+        "leftIndexProximal",       "rightIndexProximal",
+        "leftIndexIntermediate",   "rightIndexIntermediate",
+        "leftIndexDistal",         "rightIndexDistal",
+        "leftMiddleProximal",      "rightMiddleProximal",
+        "leftMiddleIntermediate",  "rightMiddleIntermediate",
+        "leftMiddleDistal",        "rightMiddleDistal",
+        "leftRingProximal",        "rightRingProximal",
+        "leftRingIntermediate",    "rightRingIntermediate",
+        "leftRingDistal",          "rightRingDistal",
+        "leftLittleProximal",      "rightLittleProximal",
+        "leftLittleIntermediate",  "rightLittleIntermediate",
+        "leftLittleDistal",        "rightLittleDistal",
+        "leftUpperLeg", "rightUpperLeg",
+        "leftLowerLeg", "rightLowerLeg",
+        "leftFoot", "rightFoot",
+        "leftToes", "rightToes",
     ]
 
     init(
@@ -212,14 +296,31 @@ final class VRMAPlayer {
         restTransforms: [Humanoid.Bones: Transform],
         chestEntity: Entity?,
         chestRestTransform: Transform?,
-        convention: VRMCoordinateConvention = .v0
+        convention: VRMCoordinateConvention = .v1
     ) throws {
         self.clip = try Self.loadClip(filePath: filePath)
         self.vrmEntity = vrmEntity
         self.boneRestTransforms = restTransforms
         self.chestEntity = chestEntity
         self.chestRestTransform = chestRestTransform
-        self.convention = convention
+        _ = convention // kept for call-site compatibility
+
+        // Precompute world-space target rest rotations by traversing the humanoid hierarchy.
+        let identity = simd_quatf(angle: 0, axis: SIMD3<Float>(0, 1, 0))
+        var wRest: [String: simd_quatf] = [:]
+        for boneName in Self.boneHierarchyOrder {
+            let parentWorld = Self.boneParent[boneName].flatMap { wRest[$0] } ?? identity
+            let localRest: simd_quatf
+            if boneName == "chest" {
+                localRest = chestRestTransform?.rotation ?? identity
+            } else if let bone = Humanoid.Bones(rawValue: boneName) {
+                localRest = restTransforms[bone]?.rotation ?? identity
+            } else {
+                localRest = identity
+            }
+            wRest[boneName] = simd_normalize(parentWorld * localRest)
+        }
+        self.worldTargetRest = wRest
     }
 
     var duration: Float { clip.duration }
@@ -244,59 +345,98 @@ final class VRMAPlayer {
 
         currentTime += Float(deltaTime)
         let clampedTime = min(currentTime, clip.duration)
-
         let blendWeight = computeBlendWeight(at: clampedTime)
 
-        var boneStates: [String: (translation: SIMD3<Float>?, rotation: simd_quatf?, sourceRest: simd_quatf)] = [:]
+        // ── Step 1: sample all rotation and translation channels ──────────────
+        var boneLocalClip: [String: simd_quatf] = [:]
+        var hipsTranslation: SIMD3<Float>? = nil
 
         for channel in clip.channels {
             if Self.faceBoneNames.contains(channel.boneName) { continue }
-
             let (lower, upper, t) = sampleSegment(for: clampedTime, in: channel.times)
-            var entry = boneStates[channel.boneName] ?? (nil, nil, channel.sourceRestRotation)
-
             switch channel.values {
             case .translation(let values):
-                let a = values[lower]
-                let b = values[upper]
-                entry.translation = simd_mix(a, b, SIMD3<Float>(repeating: t))
+                guard channel.boneName == "hips" else { continue }
+                let a = values[lower], b = values[upper]
+                hipsTranslation = simd_mix(a, b, SIMD3<Float>(repeating: t))
             case .rotation(let values):
-                let a = values[lower]
-                let b = values[upper]
-                entry.rotation = simd_slerp(a, b, t)
+                boneLocalClip[channel.boneName] = simd_slerp(values[lower], values[upper], t)
             }
-            boneStates[channel.boneName] = entry
         }
 
-        for (boneName, state) in boneStates {
+        // ── Step 2: world-space retargeting, root → leaf ─────────────────────
+        //
+        // For non-normalised VRMA files the source skeleton has large non-identity rest
+        // rotations that cascade down the bone chain (e.g. idle-maid hips ≈ Rx(97°)).
+        // Per-bone local retargeting ignores this cascade and maps arms/legs into the
+        // wrong coordinate frame of the target.  World-space retargeting accumulates the
+        // full chain product for both source and target, computes a world-space delta,
+        // and then decomposes it back into target-local space.
+        //
+        //   worldClip[B]   = worldClip[parent] * localClip[B]
+        //   worldDelta[B]  = worldClip[B] * worldSourceRest[B]⁻¹
+        //   worldTarget[B] = worldDelta[B] * worldTargetRest[B]
+        //   localTarget[B] = worldTarget[parent]⁻¹ * worldTarget[B]
+        //
+        // When the source skeleton is normalised (all source rests = identity), every
+        // worldSourceRest equals the chain of identity quaternions = identity, so the
+        // formula degenerates to the correct normalised-VRMA formula automatically.
+
+        let identity = simd_quatf(angle: 0, axis: SIMD3<Float>(0, 1, 0))
+        var worldClipRot:   [String: simd_quatf] = [:]  // source world animated
+        var worldTargetRot: [String: simd_quatf] = [:]  // target world animated
+
+        for boneName in Self.boneHierarchyOrder {
+            if Self.faceBoneNames.contains(boneName) { continue }
+
+            let parentName       = Self.boneParent[boneName]
+            let parentWorldClip  = parentName.flatMap { worldClipRot[$0]   } ?? identity
+            let parentWorldTgt   = parentName.flatMap { worldTargetRot[$0] } ?? identity
+
+            // Local clip rotation: animated value when present; source rest otherwise
+            // (bone-at-rest ⟹ delta = identity ⟹ target stays at its rest pose).
+            let localClip = boneLocalClip[boneName]
+                         ?? clip.localSourceRest[boneName]
+                         ?? identity
+
+            let worldClip = simd_normalize(parentWorldClip * localClip)
+            worldClipRot[boneName] = worldClip
+
+            let worldSrcRest = clip.worldSourceRest[boneName] ?? identity
+            let worldDelta   = simd_normalize(worldClip * worldSrcRest.inverse)
+            let wTgtRest     = worldTargetRest[boneName] ?? identity
+            let worldTgt     = simd_normalize(worldDelta * wTgtRest)
+            worldTargetRot[boneName] = worldTgt
+
+            let localTargetRot = simd_normalize(parentWorldTgt.inverse * worldTgt)
+
             if boneName == "chest" {
-                applyChest(state: state, blendWeight: blendWeight)
-                continue
+                if let chestEntity, let chestRest = chestRestTransform {
+                    chestEntity.transform.rotation = simd_slerp(chestRest.rotation, localTargetRot, blendWeight)
+                }
+            } else if let bone = Self.humanoidBone(for: boneName),
+                      let entity = vrmEntity.humanoid.node(for: bone) {
+                let restRot = boneRestTransforms[bone]?.rotation ?? entity.transform.rotation
+                entity.transform.rotation = simd_slerp(restRot, localTargetRot, blendWeight)
             }
+        }
 
-            guard let bone = Self.humanoidBone(for: boneName),
-                  let entity = vrmEntity.humanoid.node(for: bone) else { continue }
-
-            let restTransform = boneRestTransforms[bone] ?? entity.transform
-
-            if let clipRotation = state.rotation {
-                let retargeted = retargetRotation(
-                    clipRotation: clipRotation,
-                    sourceRest: state.sourceRest,
-                    targetRest: restTransform.rotation
-                )
-                entity.transform.rotation = simd_slerp(restTransform.rotation, retargeted, blendWeight)
-            }
-
-            if bone == .hips, let clipTranslation = state.translation {
-                let sourceRestY = clip.sourceHipsRestPosition.y
-                let targetRestY = restTransform.translation.y
-                let heightRatio: Float = sourceRestY > 0.001 ? targetRestY / sourceRestY : 1.0
-                let deltaY = (clipTranslation.y - sourceRestY) * heightRatio
-                var pos = restTransform.translation
-                pos.y += deltaY * blendWeight
-                entity.transform.translation = pos
-            }
+        // ── Step 3: hips translation (full XYZ) ──────────────────────────────
+        // We must apply all three axes, not just Y.  X/Z encodes weight-shift /
+        // lateral lean; ignoring them keeps the hips fixed while bones rotate
+        // outward → "legs lean but body stays" symptom.
+        //
+        // The delta is measured from sourceHipsRestPosition (first keyframe =
+        // neutral stance of the source skeleton) and scaled by the hip-height
+        // ratio so it matches the proportions of the target model.
+        if let clipTranslation = hipsTranslation,
+           let hipsEntity = vrmEntity.humanoid.node(for: .hips) {
+            let restTransform = boneRestTransforms[.hips] ?? hipsEntity.transform
+            let sourceRestY = clip.sourceHipsRestPosition.y
+            let targetRestY = restTransform.translation.y
+            let heightRatio: Float = sourceRestY > 0.001 ? targetRestY / sourceRestY : 1.0
+            let delta = (clipTranslation - clip.sourceHipsRestPosition) * heightRatio
+            hipsEntity.transform.translation = restTransform.translation + delta * blendWeight
         }
 
         applyFootGrounding(on: vrmEntity, blendWeight: blendWeight)
@@ -338,54 +478,12 @@ final class VRMAPlayer {
         }
 
         let drift = lowestFootY - groundY
-        let maxCorrection: Float = 0.15
+        let maxCorrection: Float = 0.40
         guard drift > 0.002 else { return }
 
         let correction = min(drift, maxCorrection)
         if let hipsEntity = vrmEntity.humanoid.node(for: .hips) {
             hipsEntity.transform.translation.y -= correction
-        }
-    }
-
-    // MARK: - Retargeting
-
-    /// VRMA uses VRM 1.0 bone convention (+Z forward, left arm along +X).
-    /// VRM 0.x from Unity uses the opposite (-Z forward, left arm along -X).
-    /// Conjugation by πY converts between the two: negate X and Z quaternion components.
-    private static func vrm10toVRM0x(_ q: simd_quatf) -> simd_quatf {
-        simd_quatf(ix: -q.imag.x, iy: q.imag.y, iz: -q.imag.z, r: q.real)
-    }
-
-    private func retargetRotation(
-        clipRotation: simd_quatf,
-        sourceRest: simd_quatf,
-        targetRest: simd_quatf
-    ) -> simd_quatf {
-        let normalized = simd_normalize(sourceRest.inverse * clipRotation)
-        let corrected: simd_quatf
-        switch convention {
-        case .v0:
-            corrected = Self.vrm10toVRM0x(normalized)
-        case .v1:
-            corrected = normalized
-        }
-        return simd_normalize(targetRest * corrected)
-    }
-
-    // MARK: - Chest (not in Humanoid.Bones)
-
-    private func applyChest(
-        state: (translation: SIMD3<Float>?, rotation: simd_quatf?, sourceRest: simd_quatf),
-        blendWeight: Float
-    ) {
-        guard let chestEntity, let chestRest = chestRestTransform else { return }
-        if let clipRotation = state.rotation {
-            let retargeted = retargetRotation(
-                clipRotation: clipRotation,
-                sourceRest: state.sourceRest,
-                targetRest: chestRest.rotation
-            )
-            chestEntity.transform.rotation = simd_slerp(chestRest.rotation, retargeted, blendWeight)
         }
     }
 
@@ -417,14 +515,14 @@ final class VRMAPlayer {
 
     // MARK: - Bone name → Humanoid.Bones
 
-    private static func humanoidBone(for name: String) -> Humanoid.Bones? {
+    static func humanoidBone(for name: String) -> Humanoid.Bones? {
         if name == "chest" { return nil }
         return Humanoid.Bones(rawValue: name)
     }
 
     // MARK: - GLB parsing
 
-    private static func loadClip(filePath: String) throws -> VRMAClip {
+    fileprivate static func loadClip(filePath: String) throws -> VRMAClip {
         let fileData = try Data(contentsOf: URL(fileURLWithPath: filePath))
         let (jsonData, binaryData) = try splitGLB(fileData)
         let gltf = try JSONDecoder().decode(VRMAGLTF.self, from: jsonData)
@@ -436,7 +534,11 @@ final class VRMAPlayer {
 
         var channels: [VRMAChannel] = []
         var maxTime: Float = 0
+        // Will be overridden by the first keyframe of the hips translation track,
+        // which is the true "neutral standing" height for this animation's source skeleton.
+        // Fallback: node's static JSON translation; last resort: 0.9 m.
         var hipsRestPosition = SIMD3<Float>(0, 0.9, 0)
+        var hipsRestPositionSet = false
 
         for channel in animation.channels {
             guard channel.sampler < animation.samplers.count,
@@ -457,7 +559,9 @@ final class VRMAPlayer {
                 sourceRestRotation = simd_quatf(angle: 0, axis: SIMD3<Float>(0, 1, 0))
             }
 
-            if boneName == "hips", let t = node?.translation, t.count == 3 {
+            // Use node's static translation as a preliminary fallback (often absent in VRMA).
+            if boneName == "hips", !hipsRestPositionSet,
+               let t = node?.translation, t.count == 3 {
                 hipsRestPosition = SIMD3<Float>(t[0], t[1], t[2])
             }
 
@@ -465,6 +569,12 @@ final class VRMAPlayer {
             case "translation":
                 guard boneName == "hips" else { continue }
                 let values = try readVec3(accessorIndex: sampler.output, gltf: gltf, binaryData: binaryData)
+                // The first keyframe of the translation track is the authoritative
+                // "rest / neutral stance" position for this source skeleton.
+                if let first = values.first {
+                    hipsRestPosition = first
+                    hipsRestPositionSet = true
+                }
                 channels.append(VRMAChannel(
                     boneName: boneName,
                     times: times,
@@ -484,7 +594,35 @@ final class VRMAPlayer {
             }
         }
 
-        return VRMAClip(duration: maxTime, channels: channels, sourceHipsRestPosition: hipsRestPosition)
+        // ── Build per-bone local source rest from ALL mapped nodes ───────────
+        // Includes bones that have no animation channels (their rest is still
+        // needed for the world-space hierarchy traversal).
+        let identity = simd_quatf(angle: 0, axis: SIMD3<Float>(0, 1, 0))
+        var localSourceRest: [String: simd_quatf] = [:]
+        for (nodeIndex, boneName) in boneMapping {
+            guard let node = gltf.nodes?[nodeIndex] else { continue }
+            if let r = node.rotation, r.count == 4 {
+                localSourceRest[boneName] = simd_normalize(simd_quatf(ix: r[0], iy: r[1], iz: r[2], r: r[3]))
+            } else {
+                localSourceRest[boneName] = identity
+            }
+        }
+
+        // ── Compute world-space source rests by traversing the humanoid chain ─
+        var worldSourceRest: [String: simd_quatf] = [:]
+        for boneName in boneHierarchyOrder {
+            let parentWorld = boneParent[boneName].flatMap { worldSourceRest[$0] } ?? identity
+            let local = localSourceRest[boneName] ?? identity
+            worldSourceRest[boneName] = simd_normalize(parentWorld * local)
+        }
+
+        return VRMAClip(
+            duration: maxTime,
+            channels: channels,
+            sourceHipsRestPosition: hipsRestPosition,
+            localSourceRest: localSourceRest,
+            worldSourceRest: worldSourceRest
+        )
     }
 
     /// Build node-index → humanoid bone name mapping.
@@ -723,6 +861,7 @@ final class VRMAPlayer {
 
 // MARK: - VRoid Pose Player
 
+
 private struct VRoidPoseFile: Decodable {
     let BoneDefinition: [String: PoseValue]
 
@@ -776,7 +915,16 @@ final class VRoidPosePlayer {
         chestRestTransform: Transform?,
         convention: VRMCoordinateConvention = .v0
     ) throws {
-        self.target = try Self.loadPose(filePath: filePath, convention: convention)
+        let ext = URL(fileURLWithPath: filePath).pathExtension.lowercased()
+        if ext == "vrma" {
+            self.target = try VRoidPosePlayer.loadVRMAPose(
+                filePath: filePath,
+                restTransforms: restTransforms,
+                chestRestTransform: chestRestTransform
+            )
+        } else {
+            self.target = try Self.loadPose(filePath: filePath, convention: convention)
+        }
         self.vrmEntity = vrmEntity
         self.boneRestTransforms = restTransforms
         self.chestEntity = chestEntity
@@ -863,7 +1011,108 @@ final class VRoidPosePlayer {
         simd_quatf(ix: q.imag.x, iy: -q.imag.y, iz: -q.imag.z, r: q.real)
     }
 
+    // MARK: - VRoid (.vroidpose) loader
+
     private static func loadPose(filePath: String, convention: VRMCoordinateConvention) throws -> VRoidPoseTarget {
+        return try loadVRoidPose(filePath: filePath, convention: convention)
+    }
+
+    // MARK: - VRMA-as-pose loader
+
+    /// Loads the first keyframe of a VRMA animation file as a static pose.
+    /// Uses the same world-space retargeting as VRMAPlayer so the result is identical
+    /// to pausing the animation at t=0.
+    fileprivate static func loadVRMAPose(
+        filePath: String,
+        restTransforms: [Humanoid.Bones: Transform],
+        chestRestTransform: Transform?
+    ) throws -> VRoidPoseTarget {
+        let clip = try VRMAPlayer.loadClip(filePath: filePath)
+        let identity = simd_quatf(angle: 0, axis: SIMD3<Float>(0, 1, 0))
+
+        // ── Sample t=0 (first keyframe) ──────────────────────────────────────
+        var boneLocalClip: [String: simd_quatf] = [:]
+        var hipsTranslation: SIMD3<Float>? = nil
+
+        for channel in clip.channels {
+            if VRMAPlayer.faceBoneNames.contains(channel.boneName) { continue }
+            switch channel.values {
+            case .translation(let values) where channel.boneName == "hips":
+                hipsTranslation = values.first
+            case .rotation(let values):
+                if let first = values.first {
+                    boneLocalClip[channel.boneName] = first
+                }
+            default:
+                break
+            }
+        }
+
+        // ── Compute world-space target rest (same logic as VRMAPlayer.init) ──
+        var wTargetRest: [String: simd_quatf] = [:]
+        for boneName in VRMAPlayer.boneHierarchyOrder {
+            let parentWorld = VRMAPlayer.boneParent[boneName].flatMap { wTargetRest[$0] } ?? identity
+            let localRest: simd_quatf
+            if boneName == "chest" {
+                localRest = chestRestTransform?.rotation ?? identity
+            } else if let bone = Humanoid.Bones(rawValue: boneName) {
+                localRest = restTransforms[bone]?.rotation ?? identity
+            } else {
+                localRest = identity
+            }
+            wTargetRest[boneName] = simd_normalize(parentWorld * localRest)
+        }
+
+        // ── World-space retargeting at t=0 (same as VRMAPlayer.update) ───────
+        var worldClipRot:   [String: simd_quatf] = [:]
+        var worldTargetRot: [String: simd_quatf] = [:]
+        var boneRotations: [(String, simd_quatf)] = []
+
+        for boneName in VRMAPlayer.boneHierarchyOrder {
+            if VRMAPlayer.faceBoneNames.contains(boneName) { continue }
+
+            let parentName      = VRMAPlayer.boneParent[boneName]
+            let parentWorldClip = parentName.flatMap { worldClipRot[$0] } ?? identity
+            let parentWorldTgt  = parentName.flatMap { worldTargetRot[$0] } ?? identity
+
+            let localClip = boneLocalClip[boneName]
+                         ?? clip.localSourceRest[boneName]
+                         ?? identity
+
+            let worldClip    = simd_normalize(parentWorldClip * localClip)
+            worldClipRot[boneName] = worldClip
+
+            let worldSrcRest = clip.worldSourceRest[boneName] ?? identity
+            let worldDelta   = simd_normalize(worldClip * worldSrcRest.inverse)
+            let wTgtRest     = wTargetRest[boneName] ?? identity
+            let worldTgt     = simd_normalize(worldDelta * wTgtRest)
+            worldTargetRot[boneName] = worldTgt
+
+            let localTargetRot = simd_normalize(parentWorldTgt.inverse * worldTgt)
+            boneRotations.append((boneName, localTargetRot))
+        }
+
+        // ── Hips position ─────────────────────────────────────────────────────
+        // VRoidPosePlayer scales all hips components by (modelHipsRestY / hipsPosition.y).
+        // To opt out of that scaling (our positions are already in model space),
+        // we set hipsPosition.y = targetRestY so scale = 1.0. Only X/Z delta is used.
+        let targetRestY   = restTransforms[.hips]?.translation.y ?? 0.75
+        let sourceRestY   = clip.sourceHipsRestPosition.y
+        let heightRatio   = sourceRestY > 0.001 ? targetRestY / sourceRestY : 1.0
+        let restPos       = restTransforms[.hips]?.translation ?? SIMD3(0, targetRestY, 0)
+        let hipsPosition: SIMD3<Float>
+        if let clipT = hipsTranslation {
+            let delta = (clipT - clip.sourceHipsRestPosition) * heightRatio
+            // Y fixed to targetRestY → scale=1 in VRoidPosePlayer; X/Z carry the offset
+            hipsPosition = SIMD3(restPos.x + delta.x, targetRestY, restPos.z + delta.z)
+        } else {
+            hipsPosition = SIMD3(restPos.x, targetRestY, restPos.z)
+        }
+
+        return VRoidPoseTarget(hipsPosition: hipsPosition, boneRotations: boneRotations)
+    }
+
+    private static func loadVRoidPose(filePath: String, convention: VRMCoordinateConvention) throws -> VRoidPoseTarget {
         let data = try Data(contentsOf: URL(fileURLWithPath: filePath))
         let file = try JSONDecoder().decode(VRoidPoseFile.self, from: data)
 
