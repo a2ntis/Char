@@ -202,8 +202,14 @@ final class VRMAPlayer {
     private var chestRestTransform: Transform?
 
     private let blendInDuration: Float = 0.25
-    private let blendOutDuration: Float = 0.35
     private var restGroundY: Float?
+
+    // Snapshot of bone rotations captured at the moment this player is created.
+    // Used as the blend-in source so the animation fades smoothly from whatever
+    // pose the model is currently in, rather than snapping through T-pose.
+    private var snapshotRotations: [Humanoid.Bones: simd_quatf] = [:]
+    private var snapshotChestRotation: simd_quatf? = nil
+    private var snapshotHipsTranslation: SIMD3<Float>? = nil
 
     /// World-space rest rotation of each target VRM bone (accumulated chain product).
     private var worldTargetRest: [String: simd_quatf] = [:]
@@ -211,6 +217,11 @@ final class VRMAPlayer {
     static let faceBoneNames: Set<String> = [
         "leftEye", "rightEye", "jaw",
     ]
+
+    /// When true, neck and head are not animated by this player.
+    /// Use this for idle animations so the caller can apply look-at tracking instead.
+    var skipLookBones: Bool = false
+    private static let lookBoneNames: Set<String> = ["neck", "head"]
 
     // MARK: - VRM Humanoid bone hierarchy
 
@@ -239,8 +250,13 @@ final class VRMAPlayer {
             for finger in ["Thumb","Index","Middle","Ring","Little"] {
                 let segments: [(String, String)]
                 if finger == "Thumb" {
-                    segments = [("Metacarpal", hand), ("Proximal", "\(side)\(finger)Metacarpal"),
-                                ("Distal", "\(side)\(finger)Proximal")]
+                    // VRM0.x (VRoid / VRMRealityKit): Proximal → Intermediate → Distal,
+                    // all hanging from Hand.  ThumbMetacarpal is a phantom node kept for
+                    // VRM1.0 VRMA compatibility; it contributes identity when absent.
+                    segments = [("Metacarpal",   hand),
+                                ("Proximal",     "\(side)\(finger)Metacarpal"),
+                                ("Intermediate", "\(side)\(finger)Proximal"),
+                                ("Distal",       "\(side)\(finger)Intermediate")]
                 } else {
                     segments = [("Proximal", hand), ("Intermediate", "\(side)\(finger)Proximal"),
                                 ("Distal", "\(side)\(finger)Intermediate")]
@@ -269,9 +285,10 @@ final class VRMAPlayer {
         "leftUpperArm", "rightUpperArm",
         "leftLowerArm", "rightLowerArm",
         "leftHand", "rightHand",
-        "leftThumbMetacarpal", "rightThumbMetacarpal",
-        "leftThumbProximal",   "rightThumbProximal",
-        "leftThumbDistal",     "rightThumbDistal",
+        "leftThumbMetacarpal",   "rightThumbMetacarpal",   // phantom in VRM0.x models
+        "leftThumbProximal",     "rightThumbProximal",
+        "leftThumbIntermediate", "rightThumbIntermediate", // VRM0.x (absent in VRM1.0 VRMA)
+        "leftThumbDistal",       "rightThumbDistal",
         "leftIndexProximal",       "rightIndexProximal",
         "leftIndexIntermediate",   "rightIndexIntermediate",
         "leftIndexDistal",         "rightIndexDistal",
@@ -321,6 +338,15 @@ final class VRMAPlayer {
             wRest[boneName] = simd_normalize(parentWorld * localRest)
         }
         self.worldTargetRest = wRest
+
+        // Capture current bone poses for smooth blend-in from any starting state.
+        for bone in restTransforms.keys {
+            if let entity = vrmEntity.humanoid.node(for: bone) {
+                snapshotRotations[bone] = entity.transform.rotation
+            }
+        }
+        snapshotChestRotation = chestEntity?.transform.rotation
+        snapshotHipsTranslation = vrmEntity.humanoid.node(for: .hips)?.transform.translation
     }
 
     var duration: Float { clip.duration }
@@ -388,6 +414,7 @@ final class VRMAPlayer {
 
         for boneName in Self.boneHierarchyOrder {
             if Self.faceBoneNames.contains(boneName) { continue }
+            if skipLookBones && Self.lookBoneNames.contains(boneName) { continue }
 
             let parentName       = Self.boneParent[boneName]
             let parentWorldClip  = parentName.flatMap { worldClipRot[$0]   } ?? identity
@@ -412,12 +439,15 @@ final class VRMAPlayer {
 
             if boneName == "chest" {
                 if let chestEntity, let chestRest = chestRestTransform {
-                    chestEntity.transform.rotation = simd_slerp(chestRest.rotation, localTargetRot, blendWeight)
+                    let fromRot = snapshotChestRotation ?? chestRest.rotation
+                    chestEntity.transform.rotation = simd_slerp(fromRot, localTargetRot, blendWeight)
                 }
             } else if let bone = Self.humanoidBone(for: boneName),
                       let entity = vrmEntity.humanoid.node(for: bone) {
-                let restRot = boneRestTransforms[bone]?.rotation ?? entity.transform.rotation
-                entity.transform.rotation = simd_slerp(restRot, localTargetRot, blendWeight)
+                let fromRot = snapshotRotations[bone]
+                    ?? boneRestTransforms[bone]?.rotation
+                    ?? entity.transform.rotation
+                entity.transform.rotation = simd_slerp(fromRot, localTargetRot, blendWeight)
             }
         }
 
@@ -436,16 +466,18 @@ final class VRMAPlayer {
             let targetRestY = restTransform.translation.y
             let heightRatio: Float = sourceRestY > 0.001 ? targetRestY / sourceRestY : 1.0
             let delta = (clipTranslation - clip.sourceHipsRestPosition) * heightRatio
-            hipsEntity.transform.translation = restTransform.translation + delta * blendWeight
+            let targetTranslation = restTransform.translation + delta
+            // Blend from snapshot position (whatever pose the model was in) to animation target
+            let fromTranslation = snapshotHipsTranslation ?? restTransform.translation
+            hipsEntity.transform.translation = simd_mix(
+                fromTranslation, targetTranslation, SIMD3<Float>(repeating: blendWeight))
         }
 
         applyFootGrounding(on: vrmEntity, blendWeight: blendWeight)
 
-        let finished = currentTime >= clip.duration
-        if finished {
-            restoreAll(on: vrmEntity)
-        }
-        return !finished
+        // When the clip ends, hold the last frame — no T-pose restore.
+        // The next animation's blend-in (from snapshot) handles the transition.
+        return currentTime < clip.duration
     }
 
     func restoreAll(on vrmEntity: VRMEntity) {
@@ -490,10 +522,10 @@ final class VRMAPlayer {
     // MARK: - Blend weight
 
     private func computeBlendWeight(at t: Float) -> Float {
+        // Only blend in — no blend out. The animation holds its last frame at full
+        // weight until a new animation takes over and blends in from this snapshot.
         let fadeIn = blendInDuration > 0 ? min(1, t / blendInDuration) : 1
-        let remaining = clip.duration - t
-        let fadeOut = blendOutDuration > 0 ? min(1, remaining / blendOutDuration) : 1
-        return max(0, min(fadeIn, fadeOut))
+        return max(0, fadeIn)
     }
 
     // MARK: - Sampling

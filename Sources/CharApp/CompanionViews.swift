@@ -717,6 +717,15 @@ final class CompanionVRMRealityView: ARView {
     private var vrmaPlayer: VRMAPlayer?
     private var posePlayer: VRoidPosePlayer?
     private var updateSubscription: Cancellable?
+
+    // MARK: - Idle animation cycling
+    private let idleAnimNames = ["neutral", "neutral2", "neutral3", "neutral4"]
+    private var idleWaitTime: TimeInterval = 0
+    private var idleNextTrigger: TimeInterval = 0.5
+    private var idleConverting = false
+    private var idleLastIndex: Int = -1   // avoid playing the same clip twice in a row
+    private var wasInIdleState = false
+    private var startupGreetingPlayed = false  // play greeting2 once on model load
     private var orbitTarget = SIMD3<Float>(0, 0.8, 0)
     private var orbitDistance: Float = 1.45
     private var blinkTimer: Timer?
@@ -767,6 +776,14 @@ final class CompanionVRMRealityView: ARView {
     private var dragRollTarget: Float = 0
     private var dragPitchTarget: Float = 0
 
+    // Smooth look-at blend-in after a non-look-at animation ends
+    private var lookAtWeight: Float = 1.0
+    private let lookAtBlendDuration: Float = 0.4
+    private var lookAtFromNeckRot: simd_quatf? = nil
+    private var lookAtFromHeadRot: simd_quatf? = nil
+    private var prevVrmaPlayerActive = false
+    private var prevVrmaSkipLookBones = false
+
     required init(frame frameRect: NSRect) {
         super.init(frame: frameRect)
         commonInit()
@@ -809,6 +826,10 @@ final class CompanionVRMRealityView: ARView {
                 self.vrmEntity = nil
             }
             vrmaPlayer = nil
+            startupGreetingPlayed = false
+            wasInIdleState = false
+            idleWaitTime = 0
+            idleConverting = false
             updateSubscription?.cancel()
             updateSubscription = nil
 
@@ -841,6 +862,7 @@ final class CompanionVRMRealityView: ARView {
                         }
                     }
                     self.posePlayer?.update(deltaTime: event.deltaTime)
+                    self.updateIdleAnimation(deltaTime: event.deltaTime)
                 }
             }
         } catch {
@@ -864,6 +886,79 @@ final class CompanionVRMRealityView: ARView {
         } catch {
             Swift.print("Failed to play VRMA at \(filePath): \(String(reflecting: error))")
             vrmaPlayer = nil
+        }
+    }
+
+    // MARK: - Idle animation cycling
+
+    private func updateIdleAnimation(deltaTime: TimeInterval) {
+        let isIdle = presenceState == .idle
+
+        // Reset countdown whenever we (re-)enter idle state (mid-session transitions only)
+        if isIdle && !wasInIdleState {
+            idleWaitTime = 0
+            idleNextTrigger = TimeInterval.random(in: 5...10)
+        }
+        wasInIdleState = isIdle
+
+        // Only tick when idle and nothing else is playing or loading
+        guard isIdle, vrmaPlayer == nil, posePlayer == nil, !idleConverting else { return }
+
+        // On model load, play greeting2 first — this eliminates the startup T-pose
+        if !startupGreetingPlayed {
+            startupGreetingPlayed = true
+            idleWaitTime = 0
+            idleNextTrigger = 0.5   // after greeting ends, fire first idle after 0.5s
+            playStartupGreeting()
+            return  // vrmaPlayer is now set; guard will block ticking until it finishes
+        }
+
+        idleWaitTime += deltaTime
+        guard idleWaitTime >= idleNextTrigger else { return }
+
+        idleWaitTime = 0
+        idleNextTrigger = TimeInterval.random(in: 8...18)
+        playNextIdleAnimation()
+    }
+
+    private func playStartupGreeting() {
+        let vrmaPath = AppEnvironment.assetsRootURL
+            .appendingPathComponent("VRMA/greeting2.vrma").path
+        guard presenceState == .idle,
+              vrmaPlayer == nil,
+              posePlayer == nil else { return }
+        playVRMA(filePath: vrmaPath)
+        vrmaPlayer?.skipLookBones = false
+    }
+
+    private func playNextIdleAnimation() {
+        var available = idleAnimNames.indices.filter { $0 != idleLastIndex }
+        if available.isEmpty { available = Array(idleAnimNames.indices) }
+        let chosenIndex = available.randomElement()!
+        idleLastIndex = chosenIndex
+
+        let bvhPath = AppEnvironment.assetsRootURL
+            .appendingPathComponent("BVH/\(idleAnimNames[chosenIndex]).bvh").path
+
+        idleConverting = true
+        Task.detached(priority: .utility) { [weak self] in
+            do {
+                let vrmaPath = try BVHConverter.vrmaPath(for: bvhPath)
+                await MainActor.run { [weak self] in
+                    guard let self else { return }
+                    self.idleConverting = false
+                    // Only start if we're still idle with nothing playing
+                    guard self.presenceState == .idle,
+                          self.vrmaPlayer == nil,
+                          self.posePlayer == nil else { return }
+                    self.playVRMA(filePath: vrmaPath)
+                    self.vrmaPlayer?.skipLookBones = true
+                }
+            } catch {
+                await MainActor.run { [weak self] in
+                    self?.idleConverting = false
+                }
+            }
         }
     }
 
@@ -949,6 +1044,11 @@ final class CompanionVRMRealityView: ARView {
         dragYawTarget = 0
         dragRollTarget = 0
         dragPitchTarget = 0
+        lookAtWeight = 1.0
+        lookAtFromNeckRot = nil
+        lookAtFromHeadRot = nil
+        prevVrmaPlayerActive = false
+        prevVrmaSkipLookBones = false
 
         captureBoneRestTransforms(for: vrmEntity)
     }
@@ -1166,17 +1266,44 @@ final class CompanionVRMRealityView: ARView {
 
     private func updateBodyAnimation(deltaTime: TimeInterval) {
         guard let vrmEntity else { return }
+
+        // Detect when a non-look-at animation ends so we can blend look-at back in smoothly.
+        let hadVrma = prevVrmaPlayerActive
+        let hadSkipLook = prevVrmaSkipLookBones
+        prevVrmaPlayerActive = vrmaPlayer != nil
+        prevVrmaSkipLookBones = vrmaPlayer?.skipLookBones ?? false
+
+        if hadVrma && !hadSkipLook && vrmaPlayer == nil {
+            // Animation just ended and it was controlling neck/head — capture its final pose.
+            lookAtFromNeckRot = neckEntity?.transform.rotation
+            lookAtFromHeadRot = headEntity?.transform.rotation
+            lookAtWeight = 0
+        }
+        // Advance blend weight each frame.
+        if lookAtWeight < 1 {
+            lookAtWeight = min(1, lookAtWeight + Float(deltaTime) / lookAtBlendDuration)
+        }
+
         if vrmaPlayer != nil || posePlayer != nil {
+            // Always keep root entity at base (VRMAPlayer doesn't touch it).
             vrmEntity.entity.transform.translation = rootBasePosition
             vrmEntity.entity.transform.rotation = rootBaseRotation
-            spineEntity?.transform.rotation = spineBaseRotation
-            chestEntity?.transform.rotation = chestBaseRotation
-            neckEntity?.transform.rotation = neckBaseRotation
-            headEntity?.transform.rotation = headBaseRotation
-            if let glTFChestEntity, let glTFChestRestTransform {
-                glTFChestEntity.transform = glTFChestRestTransform
+
+            // For idle animations the neck/head are intentionally left to look-at
+            // (VRMAPlayer.skipLookBones = true), so we fall through to apply it.
+            // For all other animations, reset bones fully and return.
+            let isIdleAnim = presenceState == .idle && vrmaPlayer?.skipLookBones == true
+            if !isIdleAnim {
+                spineEntity?.transform.rotation = spineBaseRotation
+                chestEntity?.transform.rotation = chestBaseRotation
+                neckEntity?.transform.rotation = neckBaseRotation
+                headEntity?.transform.rotation = headBaseRotation
+                if let glTFChestEntity, let glTFChestRestTransform {
+                    glTFChestEntity.transform = glTFChestRestTransform
+                }
+                return
             }
-            return
+            // Fall through to apply look-at to neck/head only.
         }
         motionTime += deltaTime
 
@@ -1213,27 +1340,41 @@ final class CompanionVRMRealityView: ARView {
         dragPitchCurrent += (dragPitchTarget - dragPitchCurrent) * dragSmoothing
 
         let thinkingTilt: Float = presenceState == .thinking ? -0.12 : 0
+        let isIdleAnim = vrmaPlayer?.skipLookBones == true
 
-        vrmEntity.entity.transform.translation = rootBasePosition
-        vrmEntity.entity.transform.rotation =
-            rootBaseRotation
-            * simd_quatf(angle: dragYawCurrent, axis: SIMD3<Float>(0, 1, 0))
-            * simd_quatf(angle: dragPitchCurrent, axis: SIMD3<Float>(1, 0, 0))
-            * simd_quatf(angle: dragRollCurrent, axis: SIMD3<Float>(0, 0, 1))
+        // Root entity: skip if idle animation already set it above, otherwise set it now.
+        if !isIdleAnim {
+            vrmEntity.entity.transform.translation = rootBasePosition
+            vrmEntity.entity.transform.rotation =
+                rootBaseRotation
+                * simd_quatf(angle: dragYawCurrent, axis: SIMD3<Float>(0, 1, 0))
+                * simd_quatf(angle: dragPitchCurrent, axis: SIMD3<Float>(1, 0, 0))
+                * simd_quatf(angle: dragRollCurrent, axis: SIMD3<Float>(0, 0, 1))
+        }
 
         if let neckEntity {
-            neckEntity.transform.rotation =
+            let neckTarget =
                 neckBaseRotation
                 * simd_quatf(angle: lookYawCurrent * 0.45, axis: SIMD3<Float>(0, 1, 0))
                 * simd_quatf(angle: lookPitchCurrent * 0.55 + thinkingTilt * 0.35, axis: SIMD3<Float>(1, 0, 0))
+            if let fromRot = lookAtFromNeckRot, lookAtWeight < 1 {
+                neckEntity.transform.rotation = simd_slerp(fromRot, neckTarget, lookAtWeight)
+            } else {
+                neckEntity.transform.rotation = neckTarget
+            }
         }
 
         if let headEntity {
-            headEntity.transform.rotation =
+            let headTarget =
                 headBaseRotation
                 * simd_quatf(angle: lookYawCurrent, axis: SIMD3<Float>(0, 1, 0))
                 * simd_quatf(angle: lookPitchCurrent + thinkingTilt, axis: SIMD3<Float>(1, 0, 0))
                 * simd_quatf(angle: dragRollCurrent * 0.25, axis: SIMD3<Float>(0, 0, 1))
+            if let fromRot = lookAtFromHeadRot, lookAtWeight < 1 {
+                headEntity.transform.rotation = simd_slerp(fromRot, headTarget, lookAtWeight)
+            } else {
+                headEntity.transform.rotation = headTarget
+            }
         }
     }
 

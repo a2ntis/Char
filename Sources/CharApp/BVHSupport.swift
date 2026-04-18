@@ -61,11 +61,16 @@ enum BVHConverterError: Error, LocalizedError {
 }
 
 enum BVHConverter {
+    /// Bump this string whenever the conversion logic changes (e.g. hips-Y formula).
+    /// Including the version in the cache directory name forces a full cache rebuild
+    /// without needing to touch any BVH source files.
+    private static let cacheVersion = "v3"
+
     /// Convert a BVH file to VRMA format, caching to the system temp directory.
     /// Returns the path to the generated .vrma file.
     static func vrmaPath(for bvhPath: String) throws -> String {
         let cacheDir = FileManager.default.temporaryDirectory
-            .appendingPathComponent("bvh_vrma_cache", isDirectory: true)
+            .appendingPathComponent("bvh_vrma_cache_\(cacheVersion)", isDirectory: true)
         try? FileManager.default.createDirectory(at: cacheDir, withIntermediateDirectories: true)
 
         let stem = URL(fileURLWithPath: bvhPath).deletingPathExtension().lastPathComponent
@@ -104,6 +109,7 @@ private struct BVHJoint {
     let vrmName: String?          // nil if this bone has no VRM equivalent
     let channels: [BVHChannelType]
     let channelOffset: Int        // index of first channel in the flat frame array
+    let absoluteOffsetY: Float    // accumulated Y offset from hierarchy root (BVH units)
 }
 
 private struct BVHFile {
@@ -117,7 +123,7 @@ private struct BVHFile {
 // MARK: - BVH Parser
 
 private func parseBVH(text: String) throws -> BVHFile {
-    var tokens = text
+    let tokens = text
         .components(separatedBy: .whitespacesAndNewlines)
         .map { $0.trimmingCharacters(in: .whitespaces) }
         .filter { !$0.isEmpty }
@@ -174,7 +180,8 @@ private func parseBVH(text: String) throws -> BVHFile {
     var usedVRMNames = Set<String>()
 
     // Recursive joint parser; handles ROOT, JOINT, and End Site.
-    func parseJoint() throws {
+    // parentAbsOffsetY: accumulated Y from hierarchy root to this joint's parent
+    func parseJoint(parentAbsOffsetY: Float = 0) throws {
         guard let kw = peek() else {
             throw BVHConverterError.parseError("Expected ROOT/JOINT/End")
         }
@@ -198,7 +205,10 @@ private func parseBVH(text: String) throws -> BVHFile {
         let rawName = try need()
         try skip("{")
         try skip("OFFSET")
-        _ = try needFloat(); _ = try needFloat(); _ = try needFloat()
+        _ = try needFloat()
+        let offsetY = try needFloat()
+        _ = try needFloat()
+        let absoluteOffsetY = parentAbsOffsetY + offsetY
 
         var channels: [BVHChannelType] = []
         if peekUpper() == "CHANNELS" {
@@ -231,16 +241,17 @@ private func parseBVH(text: String) throws -> BVHFile {
             rawName: rawName,
             vrmName: effective,
             channels: channels,
-            channelOffset: channelCursor
+            channelOffset: channelCursor,
+            absoluteOffsetY: absoluteOffsetY
         ))
         channelCursor += channels.count
 
         // Parse children until closing brace
         while let next = peek(), next != "}" {
             if next.uppercased() == "JOINT" || next.uppercased() == "END" {
-                try parseJoint()
+                try parseJoint(parentAbsOffsetY: absoluteOffsetY)
             } else if next.uppercased() == "ROOT" {
-                try parseJoint()
+                try parseJoint(parentAbsOffsetY: absoluteOffsetY)
             } else {
                 // Skip unexpected token
                 idx += 1
@@ -251,7 +262,7 @@ private func parseBVH(text: String) throws -> BVHFile {
 
     // One or more top-level ROOT joints
     while peekUpper() == "ROOT" {
-        try parseJoint()
+        try parseJoint(parentAbsOffsetY: 0)
     }
 
     // MOTION section
@@ -341,12 +352,13 @@ private let bvhToVRM: [String: String] = {
             m["\(side)\(finger)intermediate"] = "\(side)\(F)Intermediate"
             m["\(side)\(finger)distal"]       = "\(side)\(F)Distal"
         }
-        // Thumb — BVH files typically use 3 bones named Proximal/Intermediate/Distal
-        // but VRM uses Metacarpal/Proximal/Distal.  Shift by one level:
-        m["\(side)thumbmetacarpal"]   = "\(side)ThumbMetacarpal"  // if already VRM-named
-        m["\(side)thumbproximal"]     = "\(side)ThumbMetacarpal"  // BVH Proximal → VRM Metacarpal
-        m["\(side)thumbintermediate"] = "\(side)ThumbProximal"    // BVH Intermediate → VRM Proximal
+        // Thumb — BVH (VRoid export) uses VRM0.x naming: Proximal/Intermediate/Distal.
+        // VRMRealityKit also exposes VRM0.x thumb bones internally, so map 1-to-1.
+        m["\(side)thumbproximal"]     = "\(side)ThumbProximal"
+        m["\(side)thumbintermediate"] = "\(side)ThumbIntermediate"
         m["\(side)thumbdistal"]       = "\(side)ThumbDistal"
+        // Handle VRM1.0-named thumbs (Metacarpal/Proximal/Distal) if encountered
+        m["\(side)thumbmetacarpal"]   = "\(side)ThumbProximal"
     }
 
     // Legs
@@ -445,7 +457,21 @@ private func bvhToVRMAData(text: String) throws -> Data {
     // Build time track
     let times: [Float] = (0..<N).map { Float($0) * dt }
 
+    // Compute BVH ground level: lowest Y among foot/toes joints in the hierarchy rest pose.
+    // This is the height of the foot sole in BVH local units.
+    let footVRMNames: Set<String> = ["leftFoot", "rightFoot", "leftToes", "rightToes"]
+    let bvhGroundY: Float = bvh.joints
+        .filter { footVRMNames.contains($0.vrmName ?? "") }
+        .map { $0.absoluteOffsetY }
+        .min() ?? 0.0
+
+    // Hips rest height above ground in BVH units (used to compute ground-relative translation)
+    let hipsAbsOffsetY: Float = hipsJoint?.absoluteOffsetY ?? 0.0
+
     // Build hips translation track (if hips has position channels)
+    // Y is written as (hipsRestY + motionDeltaY - groundY) × scale so that
+    // VRMAPlayer's sourceHipsRestPosition.y ≈ (hipsAbsOffsetY - bvhGroundY) × scale,
+    // which activates the heightRatio proportional-scaling mechanism correctly.
     var hipsTranslations: [SIMD3<Float>]? = nil
     if let h = hipsJoint {
         let hasPos = h.channels.contains { $0.isTranslation }
@@ -461,10 +487,14 @@ private func bvhToVRMAData(text: String) throws -> Data {
             }
             hipsTranslations = bvh.frames.map { row in
                 let base = h.channelOffset
-                let x = xIdx.map { row[base + $0] * bvhScaleToCM } ?? 0
-                let y = yIdx.map { row[base + $0] * bvhScaleToCM } ?? 0
-                let z = zIdx.map { row[base + $0] * bvhScaleToCM } ?? 0
-                return SIMD3<Float>(x, y, z)
+                let motionX = xIdx.map { row[base + $0] } ?? 0
+                let motionY = yIdx.map { row[base + $0] } ?? 0
+                let motionZ = zIdx.map { row[base + $0] } ?? 0
+                return SIMD3<Float>(
+                    motionX * bvhScaleToCM,
+                    (hipsAbsOffsetY + motionY - bvhGroundY) * bvhScaleToCM,
+                    motionZ * bvhScaleToCM
+                )
             }
         }
     }
