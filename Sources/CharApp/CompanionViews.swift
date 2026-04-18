@@ -718,14 +718,29 @@ final class CompanionVRMRealityView: ARView {
     private var posePlayer: VRoidPosePlayer?
     private var updateSubscription: Cancellable?
 
+    // MARK: - Animation Event Mappings (set from ViewModel via binding)
+    var animationEventMappings: [String: [AnimationSlotItem]] = CompanionProfile.defaultEventMappings()
+
     // MARK: - Idle animation cycling
-    private let idleAnimNames = ["neutral", "neutral2", "neutral3", "neutral4"]
     private var idleWaitTime: TimeInterval = 0
     private var idleNextTrigger: TimeInterval = 0.5
     private var idleConverting = false
-    private var idleLastIndex: Int = -1   // avoid playing the same clip twice in a row
+    private var idleLastItemId: UUID? = nil   // avoid repeating the same clip
     private var wasInIdleState = false
-    private var startupGreetingPlayed = false  // play greeting2 once on model load
+    private var startupGreetingPlayed = false  // play startup greeting once on model load
+
+    // MARK: - Pose hold timer (auto-clear event-triggered poses after N seconds)
+    private var poseHoldTimer: Timer?
+    private let poseHoldDuration: TimeInterval = 4.0
+
+    func applyEventPose(filePath: String) {
+        applyPose(filePath: filePath)
+        poseHoldTimer?.invalidate()
+        poseHoldTimer = Timer.scheduledTimer(withTimeInterval: poseHoldDuration,
+                                              repeats: false) { [weak self] _ in
+            self?.clearPose()
+        }
+    }
     private var orbitTarget = SIMD3<Float>(0, 0.8, 0)
     private var orbitDistance: Float = 1.45
     private var blinkTimer: Timer?
@@ -922,43 +937,73 @@ final class CompanionVRMRealityView: ARView {
     }
 
     private func playStartupGreeting() {
-        let vrmaPath = AppEnvironment.assetsRootURL
-            .appendingPathComponent("VRMA/greeting2.vrma").path
-        guard presenceState == .idle,
-              vrmaPlayer == nil,
-              posePlayer == nil else { return }
-        playVRMA(filePath: vrmaPath)
-        vrmaPlayer?.skipLookBones = false
+        let items = animationEventMappings[AnimationEventType.startup.rawValue] ?? []
+        guard let item = items.randomElement() else { return }
+        guard presenceState == .idle, vrmaPlayer == nil, posePlayer == nil else { return }
+        let fullPath = AppEnvironment.assetsRootURL.appendingPathComponent(item.filePath).path
+        switch item.assetType {
+        case .vrma:
+            playVRMA(filePath: fullPath)
+            vrmaPlayer?.skipLookBones = false
+        case .bvh:
+            idleConverting = true
+            Task.detached(priority: .utility) { [weak self, fullPath, item] in
+                do {
+                    let vrmaPath = try BVHConverter.vrmaPath(for: fullPath)
+                    await MainActor.run { [weak self] in
+                        guard let self else { return }
+                        self.idleConverting = false
+                        guard self.presenceState == .idle,
+                              self.vrmaPlayer == nil, self.posePlayer == nil else { return }
+                        self.playVRMA(filePath: vrmaPath)
+                        self.vrmaPlayer?.skipLookBones = false
+                    }
+                } catch {
+                    await MainActor.run { [weak self] in self?.idleConverting = false }
+                }
+            }
+        case .pose:
+            applyEventPose(filePath: fullPath)
+        }
     }
 
     private func playNextIdleAnimation() {
-        var available = idleAnimNames.indices.filter { $0 != idleLastIndex }
-        if available.isEmpty { available = Array(idleAnimNames.indices) }
-        let chosenIndex = available.randomElement()!
-        idleLastIndex = chosenIndex
+        let items = animationEventMappings[AnimationEventType.idle.rawValue] ?? []
+        guard !items.isEmpty else { return }
+        let available = items.filter { $0.id != idleLastItemId }
+        let item = (available.isEmpty ? items : available).randomElement()!
+        idleLastItemId = item.id
 
-        let bvhPath = AppEnvironment.assetsRootURL
-            .appendingPathComponent("BVH/\(idleAnimNames[chosenIndex]).bvh").path
+        let fullPath = AppEnvironment.assetsRootURL.appendingPathComponent(item.filePath).path
 
-        idleConverting = true
-        Task.detached(priority: .utility) { [weak self] in
-            do {
-                let vrmaPath = try BVHConverter.vrmaPath(for: bvhPath)
-                await MainActor.run { [weak self] in
-                    guard let self else { return }
-                    self.idleConverting = false
-                    // Only start if we're still idle with nothing playing
-                    guard self.presenceState == .idle,
-                          self.vrmaPlayer == nil,
-                          self.posePlayer == nil else { return }
-                    self.playVRMA(filePath: vrmaPath)
-                    self.vrmaPlayer?.skipLookBones = true
-                }
-            } catch {
-                await MainActor.run { [weak self] in
-                    self?.idleConverting = false
+        switch item.assetType {
+        case .vrma:
+            guard presenceState == .idle, vrmaPlayer == nil, posePlayer == nil else { return }
+            playVRMA(filePath: fullPath)
+            vrmaPlayer?.skipLookBones = true
+
+        case .bvh:
+            idleConverting = true
+            Task.detached(priority: .utility) { [weak self, fullPath] in
+                do {
+                    let vrmaPath = try BVHConverter.vrmaPath(for: fullPath)
+                    await MainActor.run { [weak self] in
+                        guard let self else { return }
+                        self.idleConverting = false
+                        guard self.presenceState == .idle,
+                              self.vrmaPlayer == nil,
+                              self.posePlayer == nil else { return }
+                        self.playVRMA(filePath: vrmaPath)
+                        self.vrmaPlayer?.skipLookBones = true
+                    }
+                } catch {
+                    await MainActor.run { [weak self] in self?.idleConverting = false }
                 }
             }
+
+        case .pose:
+            guard presenceState == .idle, vrmaPlayer == nil else { return }
+            applyEventPose(filePath: fullPath)
         }
     }
 
@@ -1596,6 +1641,18 @@ final class AvatarPanelContentView: NSView {
             }
             .store(in: &cancellables)
 
+        viewModel.$profile
+            .map { $0.animationEventMappings }
+            .removeDuplicates { lhs, rhs in
+                // Compare by serialisation to avoid unnecessary reloads
+                (try? JSONEncoder().encode(lhs)) == (try? JSONEncoder().encode(rhs))
+            }
+            .receive(on: RunLoop.main)
+            .sink { [weak self] mappings in
+                self?.vrmView?.animationEventMappings = mappings
+            }
+            .store(in: &cancellables)
+
     }
 
     private func installAvatarView(for model: CompanionModelOption) {
@@ -1638,6 +1695,7 @@ final class AvatarPanelContentView: NSView {
             vrmView.filePath = model.entryPath
             vrmView.tapHandler = { [weak self] in
                 self?.onToggleChat()
+                self?.viewModel.triggerEventAnimation(.tap)
             }
             vrmView.scrollHandler = { [weak self] deltaY in
                 DispatchQueue.main.async {
@@ -1652,6 +1710,7 @@ final class AvatarPanelContentView: NSView {
             vrmView.presenceState = viewModel.presenceState
             vrmView.speechLevel = viewModel.speech.speechLevel
             vrmView.draggingActive = viewModel.isAvatarDragging
+            vrmView.animationEventMappings = viewModel.profile.animationEventMappings
             addPinnedSubview(vrmView)
             vrmView.reloadModel()
             self.vrmView = vrmView

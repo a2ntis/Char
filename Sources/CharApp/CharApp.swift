@@ -721,10 +721,14 @@ struct CompanionSettingsView: View {
                     }
                 }
             }
+
+            Section("Анимации и реакции") {
+                AnimationEventMappingsView(viewModel: viewModel)
+            }
         }
         .formStyle(.grouped)
         .padding(20)
-        .frame(width: 520, height: 520)
+        .frame(width: 560, height: 680)
     }
 
     private func emotionButton(_ title: String, emotion: CompanionEmotionState?) -> some View {
@@ -733,6 +737,173 @@ struct CompanionSettingsView: View {
         }
         .buttonStyle(.borderedProminent)
         .tint(viewModel.manualEmotionOverride == emotion ? .pink : .gray.opacity(0.7))
+    }
+}
+
+// MARK: - Animation Event Mappings UI
+
+private struct AnimationBrickView: View {
+    let item: AnimationSlotItem
+    var showRemove: Bool = false
+    var onRemove: (() -> Void)? = nil
+
+    var body: some View {
+        HStack(spacing: 4) {
+            Text(item.assetType.displayName)
+                .font(.system(size: 9, weight: .semibold))
+                .padding(.horizontal, 3)
+                .padding(.vertical, 2)
+                .background(brickColor.opacity(0.18))
+                .foregroundStyle(brickColor)
+                .clipShape(RoundedRectangle(cornerRadius: 3))
+            Text(item.displayName)
+                .font(.caption)
+                .lineLimit(1)
+                .truncationMode(.tail)
+            if showRemove {
+                Button(action: { onRemove?() }) {
+                    Image(systemName: "xmark")
+                        .font(.system(size: 8, weight: .bold))
+                }
+                .buttonStyle(.plain)
+                .foregroundStyle(.secondary)
+            }
+        }
+        .padding(.horizontal, 7)
+        .padding(.vertical, 4)
+        .background(brickColor.opacity(0.07), in: RoundedRectangle(cornerRadius: 6))
+        .overlay(RoundedRectangle(cornerRadius: 6).stroke(brickColor.opacity(0.28), lineWidth: 1))
+    }
+
+    var brickColor: Color {
+        switch item.assetType {
+        case .vrma: return .teal
+        case .bvh:  return .blue
+        case .pose: return .purple
+        }
+    }
+}
+
+private struct AnimationEventRowView: View {
+    let event: AnimationEventType
+    let items: [AnimationSlotItem]
+    let onUpdate: ([AnimationSlotItem]) -> Void
+    @State private var isTargeted = false
+
+    var body: some View {
+        HStack(alignment: .center, spacing: 6) {
+            Text(event.icon)
+                .font(.body)
+                .frame(width: 22)
+            Text(event.displayName)
+                .font(.caption)
+                .foregroundStyle(.secondary)
+                .frame(width: 86, alignment: .leading)
+
+            ScrollView(.horizontal, showsIndicators: false) {
+                HStack(spacing: 4) {
+                    ForEach(items) { item in
+                        AnimationBrickView(item: item, showRemove: true) {
+                            var updated = items
+                            updated.removeAll { $0.id == item.id }
+                            onUpdate(updated)
+                        }
+                    }
+                    if items.isEmpty {
+                        Text("перетащи сюда")
+                            .font(.caption2)
+                            .foregroundStyle(.tertiary)
+                            .padding(.horizontal, 8)
+                    }
+                }
+                .padding(.horizontal, 4)
+            }
+            .frame(minHeight: 28)
+            .background(
+                isTargeted ? Color.accentColor.opacity(0.1) : Color.primary.opacity(0.03),
+                in: RoundedRectangle(cornerRadius: 6)
+            )
+            .overlay(
+                RoundedRectangle(cornerRadius: 6)
+                    .stroke(isTargeted ? Color.accentColor.opacity(0.5) : Color.secondary.opacity(0.15),
+                            lineWidth: 1)
+            )
+            .dropDestination(for: AnimationSlotItem.self) { dropped, _ in
+                var updated = items
+                for src in dropped {
+                    // Fresh UUID so same animation can live in multiple slots
+                    updated.append(AnimationSlotItem(
+                        assetType: src.assetType,
+                        displayName: src.displayName,
+                        filePath: src.filePath))
+                }
+                onUpdate(updated)
+                return true
+            } isTargeted: { t in isTargeted = t }
+        }
+    }
+}
+
+private struct AnimationEventMappingsView: View {
+    @ObservedObject var viewModel: CompanionViewModel
+    @State private var paletteFilter: String = ""
+
+    private var filteredPalette: [AnimationSlotItem] {
+        let all = viewModel.allAnimationsUnified
+        guard !paletteFilter.isEmpty else { return all }
+        return all.filter { $0.displayName.localizedCaseInsensitiveContains(paletteFilter) }
+    }
+
+    var body: some View {
+        HStack(alignment: .top, spacing: 10) {
+            // ── Palette ──
+            VStack(alignment: .leading, spacing: 6) {
+                Text("Доступные")
+                    .font(.caption.weight(.semibold))
+                    .foregroundStyle(.secondary)
+                TextField("Поиск…", text: $paletteFilter)
+                    .textFieldStyle(.roundedBorder)
+                    .font(.caption)
+                ScrollView {
+                    VStack(alignment: .leading, spacing: 4) {
+                        ForEach(filteredPalette) { item in
+                            AnimationBrickView(item: item)
+                                .draggable(item)
+                                .frame(maxWidth: .infinity, alignment: .leading)
+                        }
+                    }
+                    .padding(.bottom, 4)
+                }
+            }
+            .frame(width: 162)
+
+            Divider()
+
+            // ── Event slots ──
+            ScrollView {
+                VStack(alignment: .leading, spacing: 2) {
+                    ForEach(AnimationEventCategory.allCases, id: \.self) { category in
+                        let events = AnimationEventType.allCases.filter { $0.category == category }
+                        Text("\(category.icon) \(category.displayName)")
+                            .font(.caption.weight(.semibold))
+                            .foregroundStyle(.secondary)
+                            .padding(.top, 8)
+                            .padding(.bottom, 2)
+                        ForEach(events) { event in
+                            AnimationEventRowView(
+                                event: event,
+                                items: viewModel.profile.animationEventMappings[event.rawValue] ?? [],
+                                onUpdate: { newItems in
+                                    viewModel.profile.animationEventMappings[event.rawValue] = newItems
+                                }
+                            )
+                        }
+                    }
+                }
+                .padding(.trailing, 4)
+            }
+        }
+        .frame(height: 380)
     }
 }
 

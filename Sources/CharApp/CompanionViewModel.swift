@@ -810,7 +810,11 @@ final class CompanionViewModel: ObservableObject {
 
     func pulseDragging() {
         dragResetTask?.cancel()
+        let wasAlreadyDragging = isAvatarDragging
         isAvatarDragging = true
+        if !wasAlreadyDragging {
+            triggerEventAnimation(.drag)
+        }
         dragResetTask = Task { [weak self] in
             try? await Task.sleep(for: .milliseconds(220))
             await MainActor.run {
@@ -917,6 +921,72 @@ final class CompanionViewModel: ObservableObject {
         availablePoses = PoseCatalog.discover(in: AppEnvironment.assetsRootURL)
     }
 
+    // MARK: - Animation Event System
+
+    /// All discovered animations and poses merged into a single palette list.
+    var allAnimationsUnified: [AnimationSlotItem] {
+        let root = AppEnvironment.assetsRootURL.path
+        func rel(_ full: String) -> String {
+            full.hasPrefix(root) ? String(full.dropFirst(root.count + 1)) : full
+        }
+        let vrmas = availableVRMAAnimations.map {
+            AnimationSlotItem(assetType: .vrma, displayName: $0.displayName, filePath: rel($0.filePath))
+        }
+        let bvhs = availableBVHAnimations.map {
+            AnimationSlotItem(assetType: .bvh, displayName: $0.displayName, filePath: rel($0.filePath))
+        }
+        let poses = availablePoses.map {
+            AnimationSlotItem(assetType: .pose, displayName: $0.displayName, filePath: rel($0.filePath))
+        }
+        return vrmas + bvhs + poses
+    }
+
+    /// Trigger an event animation from the user-configured mapping.
+    /// Called by state/emotion observers, gesture handlers, and (future) text analysis.
+    func triggerEventAnimation(_ event: AnimationEventType) {
+        let items = profile.animationEventMappings[event.rawValue] ?? []
+        guard let item = items.randomElement() else { return }
+        let fullPath = AppEnvironment.assetsRootURL.appendingPathComponent(item.filePath).path
+        switch item.assetType {
+        case .vrma:
+            manualPoseRequest = nil
+            manualVRMARequest = CompanionVRMARequest(label: item.displayName, filePath: fullPath)
+        case .bvh:
+            Task.detached(priority: .userInitiated) { [weak self, item, fullPath] in
+                do {
+                    let vrmaPath = try BVHConverter.vrmaPath(for: fullPath)
+                    await MainActor.run {
+                        guard let self else { return }
+                        self.manualPoseRequest = nil
+                        self.manualVRMARequest = CompanionVRMARequest(
+                            label: item.displayName, filePath: vrmaPath)
+                    }
+                } catch {
+                    Swift.print("BVH event trigger error: \(error)")
+                }
+            }
+        case .pose:
+            manualVRMARequest = nil
+            manualPoseRequest = CompanionPoseRequest(label: item.displayName, filePath: fullPath)
+        }
+    }
+
+    /// Map CompanionEmotionState to AnimationEventType and trigger.
+    func triggerEmotionAnimation(for emotion: CompanionEmotionState) {
+        guard !isManualPreviewMode else { return }
+        let event: AnimationEventType
+        switch emotion {
+        case .happy:    event = .joy
+        case .excited:  event = .excitement
+        case .angry:    event = .anger
+        case .shy:      event = .embarrassment
+        case .sleepy:   event = .relief
+        case .thinking: event = .curiosity
+        case .neutral:  return
+        }
+        triggerEventAnimation(event)
+    }
+
     private func bindPresence() {
         speech.$isListening
             .receive(on: RunLoop.main)
@@ -961,7 +1031,7 @@ final class CompanionViewModel: ObservableObject {
         }
     }
 
-    private func persistProfile() {
+    func persistProfile() {
         guard let data = try? JSONEncoder().encode(profile) else { return }
         UserDefaults.standard.set(data, forKey: DefaultsKey.profile)
     }
@@ -1082,7 +1152,14 @@ final class CompanionViewModel: ObservableObject {
     private func setEmotion(for text: String) {
         guard !isManualPreviewMode else { return }
         emotionResetTask?.cancel()
-        emotionState = detectEmotion(from: text)
+        let detected = detectEmotion(from: text)
+        let previous = emotionState
+        emotionState = detected
+
+        // Trigger a one-shot animation when emotion changes to non-neutral
+        if detected != .neutral && detected != previous {
+            triggerEmotionAnimation(for: detected)
+        }
 
         emotionResetTask = Task { [weak self] in
             try? await Task.sleep(for: .seconds(4.5))

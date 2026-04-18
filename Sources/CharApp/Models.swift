@@ -1,5 +1,6 @@
 import Foundation
 import CoreGraphics
+import UniformTypeIdentifiers
 
 enum CompanionLLMProvider: String, CaseIterable, Codable, Hashable, Identifiable {
     case ollama
@@ -179,6 +180,200 @@ struct ChatMessage: Identifiable, Hashable {
     }
 }
 
+// MARK: - Animation Event System
+
+enum AnimationAssetType: String, Codable, Hashable, CaseIterable {
+    case vrma
+    case bvh
+    case pose
+
+    var displayName: String {
+        switch self {
+        case .vrma: return "VRMA"
+        case .bvh:  return "BVH"
+        case .pose: return "Pose"
+        }
+    }
+}
+
+/// A single animation or pose item that can be assigned to an event slot.
+struct AnimationSlotItem: Codable, Identifiable, Hashable {
+    var id: UUID = UUID()
+    var assetType: AnimationAssetType
+    var displayName: String
+    /// Relative path from assetsRootURL, e.g. "VRMA/greeting2.vrma" or "BVH/neutral.bvh"
+    var filePath: String
+}
+
+extension AnimationSlotItem: Transferable {
+    static var transferRepresentation: some TransferRepresentation {
+        DataRepresentation(contentType: .data) { item in
+            try JSONEncoder().encode(item)
+        } importing: { data in
+            try JSONDecoder().decode(AnimationSlotItem.self, from: data)
+        }
+    }
+}
+
+enum AnimationPlayMode: String, Codable {
+    /// Random pick, play, then pick another on finish — used for state events.
+    case cycling
+    /// Play once, then return to current state cycling.
+    case oneShot
+}
+
+enum AnimationEventCategory: String, Codable, CaseIterable {
+    case state
+    case emotion
+    case interaction
+    case command
+
+    var displayName: String {
+        switch self {
+        case .state:       return "Состояния"
+        case .emotion:     return "Эмоции"
+        case .interaction: return "Взаимодействие"
+        case .command:     return "Команды"
+        }
+    }
+
+    var icon: String {
+        switch self {
+        case .state:       return "🔄"
+        case .emotion:     return "😊"
+        case .interaction: return "👆"
+        case .command:     return "⚡"
+        }
+    }
+}
+
+enum AnimationEventType: String, Codable, CaseIterable, Identifiable {
+    // State events (cycling while state is active)
+    case startup, idle, speaking, thinking, listening
+    // Emotion reactions (one-shot)
+    case joy, excitement, anger, sadness, fear, surprise, love
+    case disgust, confusion, approval, disapproval, embarrassment
+    case pride, gratitude, curiosity, admiration, nervousness, relief, desire, remorse
+    // Interaction reactions (one-shot)
+    case tap, drag
+    // Command actions (one-shot, text-triggered in future)
+    case dance, spin, wave, jump, laydown, sitdown, standup, walk, attention, dogeza, peace
+
+    var id: String { rawValue }
+
+    var displayName: String {
+        switch self {
+        case .startup:       return "Запуск"
+        case .idle:          return "Idle"
+        case .speaking:      return "Говорит"
+        case .thinking:      return "Думает"
+        case .listening:     return "Слушает"
+        case .joy:           return "Радость"
+        case .excitement:    return "Восторг"
+        case .anger:         return "Злость"
+        case .sadness:       return "Грусть"
+        case .fear:          return "Страх"
+        case .surprise:      return "Удивление"
+        case .love:          return "Любовь"
+        case .disgust:       return "Отвращение"
+        case .confusion:     return "Смятение"
+        case .approval:      return "Согласие"
+        case .disapproval:   return "Несогласие"
+        case .embarrassment: return "Смущение"
+        case .pride:         return "Гордость"
+        case .gratitude:     return "Благодарность"
+        case .curiosity:     return "Любопытство"
+        case .admiration:    return "Восхищение"
+        case .nervousness:   return "Нервозность"
+        case .relief:        return "Облегчение"
+        case .desire:        return "Желание"
+        case .remorse:       return "Сожаление"
+        case .tap:           return "Тап"
+        case .drag:          return "Перетаскивание"
+        case .dance:         return "Танец"
+        case .spin:          return "Спин"
+        case .wave:          return "Помахать"
+        case .jump:          return "Прыжок"
+        case .laydown:       return "Лечь"
+        case .sitdown:       return "Сесть"
+        case .standup:       return "Встать"
+        case .walk:          return "Пройтись"
+        case .attention:     return "Привлечь внимание"
+        case .dogeza:        return "Догеза"
+        case .peace:         return "Peace sign"
+        }
+    }
+
+    var icon: String {
+        switch self {
+        case .startup:       return "🚀"
+        case .idle:          return "💤"
+        case .speaking:      return "🗣️"
+        case .thinking:      return "🤔"
+        case .listening:     return "👂"
+        case .joy:           return "😊"
+        case .excitement:    return "🤩"
+        case .anger:         return "😠"
+        case .sadness:       return "😢"
+        case .fear:          return "😨"
+        case .surprise:      return "😲"
+        case .love:          return "🥰"
+        case .disgust:       return "🤢"
+        case .confusion:     return "😕"
+        case .approval:      return "👍"
+        case .disapproval:   return "👎"
+        case .embarrassment: return "😳"
+        case .pride:         return "😤"
+        case .gratitude:     return "🙏"
+        case .curiosity:     return "🧐"
+        case .admiration:    return "😍"
+        case .nervousness:   return "😬"
+        case .relief:        return "😮‍💨"
+        case .desire:        return "🤤"
+        case .remorse:       return "😞"
+        case .tap:           return "👆"
+        case .drag:          return "✋"
+        case .dance:         return "💃"
+        case .spin:          return "🌀"
+        case .wave:          return "👋"
+        case .jump:          return "⬆️"
+        case .laydown:       return "🛌"
+        case .sitdown:       return "🪑"
+        case .standup:       return "🧍"
+        case .walk:          return "🚶"
+        case .attention:     return "📣"
+        case .dogeza:        return "🙇"
+        case .peace:         return "✌️"
+        }
+    }
+
+    var playMode: AnimationPlayMode {
+        switch self {
+        case .startup, .idle, .speaking, .thinking, .listening: return .cycling
+        default: return .oneShot
+        }
+    }
+
+    var category: AnimationEventCategory {
+        switch self {
+        case .startup, .idle, .speaking, .thinking, .listening:
+            return .state
+        case .joy, .excitement, .anger, .sadness, .fear, .surprise, .love,
+             .disgust, .confusion, .approval, .disapproval, .embarrassment,
+             .pride, .gratitude, .curiosity, .admiration, .nervousness,
+             .relief, .desire, .remorse:
+            return .emotion
+        case .tap, .drag:
+            return .interaction
+        case .dance, .spin, .wave, .jump, .laydown, .sitdown, .standup,
+             .walk, .attention, .dogeza, .peace:
+            return .command
+        }
+    }
+}
+
+// MARK: - CompanionProfile
+
 struct CompanionProfile: Codable, Hashable {
     var name: String = "Hana"
     var persona: String = """
@@ -214,6 +409,7 @@ struct CompanionProfile: Codable, Hashable {
     var openAIEndpoint: URL = URL(string: "https://api.openai.com/v1/chat/completions")!
     var lmStudioModel: String = ""
     var lmStudioEndpoint: URL = URL(string: "http://127.0.0.1:1234/v1/chat/completions")!
+    var animationEventMappings: [String: [AnimationSlotItem]] = CompanionProfile.defaultEventMappings()
 
     var activeModel: String {
         switch provider {
@@ -293,6 +489,7 @@ struct CompanionProfile: Codable, Hashable {
         case openAIEndpoint
         case lmStudioModel
         case lmStudioEndpoint
+        case animationEventMappings
     }
 
     init() {}
@@ -333,6 +530,23 @@ struct CompanionProfile: Codable, Hashable {
         openAIEndpoint = try container.decodeIfPresent(URL.self, forKey: .openAIEndpoint) ?? URL(string: "https://api.openai.com/v1/chat/completions")!
         lmStudioModel = try container.decodeIfPresent(String.self, forKey: .lmStudioModel) ?? ""
         lmStudioEndpoint = try container.decodeIfPresent(URL.self, forKey: .lmStudioEndpoint) ?? URL(string: "http://127.0.0.1:1234/v1/chat/completions")!
+        animationEventMappings = try container.decodeIfPresent(
+            [String: [AnimationSlotItem]].self, forKey: .animationEventMappings
+        ) ?? CompanionProfile.defaultEventMappings()
+    }
+
+    static func defaultEventMappings() -> [String: [AnimationSlotItem]] {
+        var m: [String: [AnimationSlotItem]] = [:]
+        m[AnimationEventType.startup.rawValue] = [
+            AnimationSlotItem(assetType: .vrma, displayName: "greeting2", filePath: "VRMA/greeting2.vrma"),
+        ]
+        m[AnimationEventType.idle.rawValue] = [
+            AnimationSlotItem(assetType: .bvh, displayName: "neutral",  filePath: "BVH/neutral.bvh"),
+            AnimationSlotItem(assetType: .bvh, displayName: "neutral2", filePath: "BVH/neutral2.bvh"),
+            AnimationSlotItem(assetType: .bvh, displayName: "neutral3", filePath: "BVH/neutral3.bvh"),
+            AnimationSlotItem(assetType: .bvh, displayName: "neutral4", filePath: "BVH/neutral4.bvh"),
+        ]
+        return m
     }
 }
 
