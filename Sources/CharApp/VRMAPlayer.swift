@@ -214,6 +214,11 @@ final class VRMAPlayer {
     /// World-space rest rotation of each target VRM bone (accumulated chain product).
     private var worldTargetRest: [String: simd_quatf] = [:]
 
+    /// Bones that actually have a real entity in the target VRM model.
+    /// Used to skip "phantom" bones (e.g. rightThumbMetacarpal in VRM 0.x models)
+    /// when decomposing world-space rotations back to local space.
+    private var realTargetBoneNames: Set<String> = []
+
     static let faceBoneNames: Set<String> = [
         "leftEye", "rightEye", "jaw",
     ]
@@ -325,6 +330,12 @@ final class VRMAPlayer {
         // Precompute world-space target rest rotations by traversing the humanoid hierarchy.
         let identity = simd_quatf(angle: 0, axis: SIMD3<Float>(0, 1, 0))
         var wRest: [String: simd_quatf] = [:]
+
+        // Seed realBones before the loop so the thumb metacarpal fix can insert entries.
+        var realBones: Set<String> = []
+        for bone in restTransforms.keys { realBones.insert(bone.rawValue) }
+        if chestEntity != nil { realBones.insert("chest") }
+
         for boneName in Self.boneHierarchyOrder {
             let parentWorld = Self.boneParent[boneName].flatMap { wRest[$0] } ?? identity
             let localRest: simd_quatf
@@ -332,12 +343,32 @@ final class VRMAPlayer {
                 localRest = chestRestTransform?.rotation ?? identity
             } else if let bone = Humanoid.Bones(rawValue: boneName) {
                 localRest = restTransforms[bone]?.rotation ?? identity
+            } else if boneName == "rightThumbMetacarpal" || boneName == "leftThumbMetacarpal" {
+                // Humanoid.Bones has no thumbMetacarpal case, so this branch handles it.
+                // In VRM 1.0 models the metacarpal IS a real entity between Hand and
+                // ThumbProximal. Detect it by checking the proximal entity's actual parent:
+                // if that parent is not the hand entity, it must be the metacarpal.
+                let proxBone: Humanoid.Bones = boneName.hasPrefix("left") ? .leftThumbProximal : .rightThumbProximal
+                let handBone: Humanoid.Bones = boneName.hasPrefix("left") ? .leftHand : .rightHand
+                if let proxEntity = vrmEntity.humanoid.node(for: proxBone),
+                   let handEntity = vrmEntity.humanoid.node(for: handBone),
+                   let metaEntity = proxEntity.parent, metaEntity !== handEntity {
+                    // VRM 1.0 layout: include the metacarpal's actual local rotation
+                    // so all downstream thumb bones get the correct world-rest chain.
+                    localRest = Self.canonicalize(metaEntity.transform.rotation)
+                    realBones.insert(boneName)  // treat as real for decomposition parent lookup
+                } else {
+                    localRest = identity        // VRM 0.x or model without a metacarpal
+                }
             } else {
                 localRest = identity
             }
             wRest[boneName] = simd_normalize(parentWorld * localRest)
         }
         self.worldTargetRest = wRest
+
+        // Record which bones actually exist in the target model (already built above).
+        self.realTargetBoneNames = realBones
 
         // Capture current bone poses for smooth blend-in from any starting state.
         for bone in restTransforms.keys {
@@ -417,8 +448,7 @@ final class VRMAPlayer {
             if skipLookBones && Self.lookBoneNames.contains(boneName) { continue }
 
             let parentName       = Self.boneParent[boneName]
-            let parentWorldClip  = parentName.flatMap { worldClipRot[$0]   } ?? identity
-            let parentWorldTgt   = parentName.flatMap { worldTargetRot[$0] } ?? identity
+            let parentWorldClip  = parentName.flatMap { worldClipRot[$0] } ?? identity
 
             // Local clip rotation: animated value when present; source rest otherwise
             // (bone-at-rest ⟹ delta = identity ⟹ target stays at its rest pose).
@@ -435,7 +465,12 @@ final class VRMAPlayer {
             let worldTgt     = simd_normalize(worldDelta * wTgtRest)
             worldTargetRot[boneName] = worldTgt
 
-            let localTargetRot = simd_normalize(parentWorldTgt.inverse * worldTgt)
+            // Decompose world target rotation back to local space.
+            // Distinguishes animated bones (use worldTargetRot) from physical-phantom
+            // bones like the VRM 1.0 thumbMetacarpal that exist in the entity hierarchy
+            // but are never written to (use worldTargetRest so they stay at rest).
+            let effectiveParentTgt = effectiveParentWorldForDecomposition(for: boneName, worldTargetRot: worldTargetRot)
+            let localTargetRot = simd_normalize(effectiveParentTgt.inverse * worldTgt)
 
             if boneName == "chest" {
                 if let chestEntity, let chestRest = chestRestTransform {
@@ -519,6 +554,69 @@ final class VRMAPlayer {
         }
     }
 
+    // MARK: - Effective parent for decomposition
+
+    /// Returns the world-space rotation to use as the parent frame when decomposing
+    /// a bone's local target rotation from its world target rotation.
+    ///
+    /// Two kinds of "real" bones exist in the target model:
+    ///  • **Animated** — have a `Humanoid.Bones` case (or are "chest"); their entity
+    ///    rotation is set each frame → return `worldTargetRot[bone]`.
+    ///  • **Physical phantom** — entity exists but no `Humanoid.Bones` case, so we
+    ///    never write to its rotation; it stays at rest relative to its animated ancestor.
+    ///    World rotation = `worldTargetRot[ancestor] × worldTargetRest[ancestor].inverse × worldTargetRest[phantom]`
+    ///
+    /// Example: VRM 1.0 `rightThumbMetacarpal` sits between Hand and ThumbProximal.
+    /// Since we never write to it, its world rotation = worldTargetRot[hand] × metacarpalLocalRest,
+    /// which is what worldTargetRot[hand] × worldTargetRest[hand].inverse × worldTargetRest[metacarpal] gives.
+    private func effectiveParentWorldForDecomposition(
+        for boneName: String,
+        worldTargetRot: [String: simd_quatf]
+    ) -> simd_quatf {
+        let identity = simd_quatf(angle: 0, axis: SIMD3<Float>(0, 1, 0))
+        var current = boneName
+        // Track the NEAREST real-but-non-animated (physical-phantom) parent we've seen
+        // while walking up the chain. A physical-phantom bone has a real entity in the
+        // scene but no Humanoid.Bones case, so we never set its rotation — it stays at
+        // its rest rotation relative to its animated ancestor.
+        var nearestPhantom: String? = nil
+
+        while let parentName = Self.boneParent[current] {
+            guard realTargetBoneNames.contains(parentName) else {
+                current = parentName
+                continue
+            }
+            let isAnimated: Bool
+            if parentName == "chest" {
+                isAnimated = chestEntity != nil
+            } else {
+                isAnimated = Humanoid.Bones(rawValue: parentName) != nil
+            }
+            if isAnimated {
+                let animRot = worldTargetRot[parentName] ?? identity
+                if let phantom = nearestPhantom {
+                    // The immediate parent of `boneName` is a physical-phantom bone.
+                    // Its actual world rotation = animRot × (accumulated rest chain from
+                    // animated ancestor to phantom).  We compute this as:
+                    //   animRot × worldTargetRest[animatedAncestor].inverse × worldTargetRest[phantom]
+                    // Because worldTargetRest encodes the full accumulated rest chain from
+                    // the root, dividing out the ancestor's rest isolates the delta from
+                    // that ancestor to the phantom.
+                    let animRest    = worldTargetRest[parentName] ?? identity
+                    let phantomRest = worldTargetRest[phantom] ?? identity
+                    return simd_normalize(animRot * simd_normalize(animRest.inverse * phantomRest))
+                } else {
+                    return animRot
+                }
+            } else {
+                // Physical phantom — record only the nearest one and keep walking up
+                if nearestPhantom == nil { nearestPhantom = parentName }
+                current = parentName
+            }
+        }
+        return identity
+    }
+
     // MARK: - Blend weight
 
     private func computeBlendWeight(at t: Float) -> Float {
@@ -586,7 +684,7 @@ final class VRMAPlayer {
             let node = gltf.nodes?[nodeIndex]
             let sourceRestRotation: simd_quatf
             if let r = node?.rotation, r.count == 4 {
-                sourceRestRotation = simd_normalize(simd_quatf(ix: r[0], iy: r[1], iz: r[2], r: r[3]))
+                sourceRestRotation = canonicalize(simd_quatf(ix: r[0], iy: r[1], iz: r[2], r: r[3]))
             } else {
                 sourceRestRotation = simd_quatf(angle: 0, axis: SIMD3<Float>(0, 1, 0))
             }
@@ -634,7 +732,7 @@ final class VRMAPlayer {
         for (nodeIndex, boneName) in boneMapping {
             guard let node = gltf.nodes?[nodeIndex] else { continue }
             if let r = node.rotation, r.count == 4 {
-                localSourceRest[boneName] = simd_normalize(simd_quatf(ix: r[0], iy: r[1], iz: r[2], r: r[3]))
+                localSourceRest[boneName] = canonicalize(simd_quatf(ix: r[0], iy: r[1], iz: r[2], r: r[3]))
             } else {
                 localSourceRest[boneName] = identity
             }
@@ -873,8 +971,17 @@ final class VRMAPlayer {
             let y = readFloat(from: slice, offset: base + 4)
             let z = readFloat(from: slice, offset: base + 8)
             let w = readFloat(from: slice, offset: base + 12)
-            return simd_normalize(simd_quatf(ix: x, iy: y, iz: z, r: w))
+            return canonicalize(simd_quatf(ix: x, iy: y, iz: z, r: w))
         }
+    }
+
+    /// Normalize and place the quaternion in the positive-w hemisphere.
+    /// `q` and `-q` encode the same rotation; keeping everything in one hemisphere
+    /// ensures simd_slerp always takes the short path and quaternion multiplication
+    /// chains stay consistent (avoids the "broken finger" 360° flip artifact).
+    fileprivate static func canonicalize(_ q: simd_quatf) -> simd_quatf {
+        let n = simd_normalize(q)
+        return n.real < 0 ? simd_quatf(ix: -n.imag.x, iy: -n.imag.y, iz: -n.imag.z, r: -n.real) : n
     }
 
     private static func readFloat(from data: Data, offset: Int) -> Float {
@@ -949,10 +1056,26 @@ final class VRoidPosePlayer {
     ) throws {
         let ext = URL(fileURLWithPath: filePath).pathExtension.lowercased()
         if ext == "vrma" {
+            // Detect VRM 1.0 thumb metacarpal entities (not in Humanoid.Bones enum).
+            // Their local rest rotations must be injected into the world-rest chain so
+            // thumb retargeting in poses matches what VRMAPlayer does for animations.
+            var metacarpalRests: [String: simd_quatf] = [:]
+            for (side, proxBone, handBone) in [
+                ("left",  Humanoid.Bones.leftThumbProximal,  Humanoid.Bones.leftHand),
+                ("right", Humanoid.Bones.rightThumbProximal, Humanoid.Bones.rightHand),
+            ] {
+                if let proxEntity = vrmEntity.humanoid.node(for: proxBone),
+                   let handEntity = vrmEntity.humanoid.node(for: handBone),
+                   let metaEntity = proxEntity.parent, metaEntity !== handEntity {
+                    metacarpalRests["\(side)ThumbMetacarpal"] =
+                        VRMAPlayer.canonicalize(metaEntity.transform.rotation)
+                }
+            }
             self.target = try VRoidPosePlayer.loadVRMAPose(
                 filePath: filePath,
                 restTransforms: restTransforms,
-                chestRestTransform: chestRestTransform
+                chestRestTransform: chestRestTransform,
+                metacarpalRestRotations: metacarpalRests
             )
         } else {
             self.target = try Self.loadPose(filePath: filePath, convention: convention)
@@ -1054,10 +1177,15 @@ final class VRoidPosePlayer {
     /// Loads the first keyframe of a VRMA animation file as a static pose.
     /// Uses the same world-space retargeting as VRMAPlayer so the result is identical
     /// to pausing the animation at t=0.
+    ///
+    /// - Parameter metacarpalRestRotations: Local rest rotations for VRM 1.0 thumb
+    ///   metacarpal bones (keyed by "leftThumbMetacarpal" / "rightThumbMetacarpal").
+    ///   Pass an empty dict for VRM 0.x models where the metacarpal is a phantom node.
     fileprivate static func loadVRMAPose(
         filePath: String,
         restTransforms: [Humanoid.Bones: Transform],
-        chestRestTransform: Transform?
+        chestRestTransform: Transform?,
+        metacarpalRestRotations: [String: simd_quatf] = [:]
     ) throws -> VRoidPoseTarget {
         let clip = try VRMAPlayer.loadClip(filePath: filePath)
         let identity = simd_quatf(angle: 0, axis: SIMD3<Float>(0, 1, 0))
@@ -1081,6 +1209,13 @@ final class VRoidPosePlayer {
         }
 
         // ── Compute world-space target rest (same logic as VRMAPlayer.init) ──
+        // Bones that actually exist in the target model.
+        var realTargetBones: Set<String> = []
+        for bone in restTransforms.keys { realTargetBones.insert(bone.rawValue) }
+        if chestRestTransform != nil { realTargetBones.insert("chest") }
+        // VRM 1.0 thumb metacarpal: real entity, not in Humanoid.Bones enum
+        for name in metacarpalRestRotations.keys { realTargetBones.insert(name) }
+
         var wTargetRest: [String: simd_quatf] = [:]
         for boneName in VRMAPlayer.boneHierarchyOrder {
             let parentWorld = VRMAPlayer.boneParent[boneName].flatMap { wTargetRest[$0] } ?? identity
@@ -1089,10 +1224,48 @@ final class VRoidPosePlayer {
                 localRest = chestRestTransform?.rotation ?? identity
             } else if let bone = Humanoid.Bones(rawValue: boneName) {
                 localRest = restTransforms[bone]?.rotation ?? identity
+            } else if let metacarpalRest = metacarpalRestRotations[boneName] {
+                // VRM 1.0 thumb metacarpal: use the actual entity rest rotation
+                localRest = metacarpalRest
             } else {
                 localRest = identity
             }
             wTargetRest[boneName] = simd_normalize(parentWorld * localRest)
+        }
+
+        // Helper: effective parent world rotation for local decomposition.
+        // Mirrors VRMAPlayer.effectiveParentWorldForDecomposition exactly.
+        // For physical-phantom bones (real entity, no Humanoid.Bones case, e.g. thumbMetacarpal)
+        // the entity stays at rest, so its world rotation = animatedAncestorWorldRot × (rest delta).
+        func effectiveParentTgtRot(for boneName: String, worldTargetRot: [String: simd_quatf]) -> simd_quatf {
+            var current = boneName
+            var nearestPhantom: String? = nil
+            while let parentName = VRMAPlayer.boneParent[current] {
+                guard realTargetBones.contains(parentName) else {
+                    current = parentName
+                    continue
+                }
+                let isAnimated: Bool
+                if parentName == "chest" {
+                    isAnimated = chestRestTransform != nil
+                } else {
+                    isAnimated = Humanoid.Bones(rawValue: parentName) != nil
+                }
+                if isAnimated {
+                    let animRot = worldTargetRot[parentName] ?? identity
+                    if let phantom = nearestPhantom {
+                        let animRest    = wTargetRest[parentName] ?? identity
+                        let phantomRest = wTargetRest[phantom] ?? identity
+                        return simd_normalize(animRot * simd_normalize(animRest.inverse * phantomRest))
+                    } else {
+                        return animRot
+                    }
+                } else {
+                    if nearestPhantom == nil { nearestPhantom = parentName }
+                    current = parentName
+                }
+            }
+            return identity
         }
 
         // ── World-space retargeting at t=0 (same as VRMAPlayer.update) ───────
@@ -1105,7 +1278,6 @@ final class VRoidPosePlayer {
 
             let parentName      = VRMAPlayer.boneParent[boneName]
             let parentWorldClip = parentName.flatMap { worldClipRot[$0] } ?? identity
-            let parentWorldTgt  = parentName.flatMap { worldTargetRot[$0] } ?? identity
 
             let localClip = boneLocalClip[boneName]
                          ?? clip.localSourceRest[boneName]
@@ -1120,7 +1292,8 @@ final class VRoidPosePlayer {
             let worldTgt     = simd_normalize(worldDelta * wTgtRest)
             worldTargetRot[boneName] = worldTgt
 
-            let localTargetRot = simd_normalize(parentWorldTgt.inverse * worldTgt)
+            let effectiveParentTgt = effectiveParentTgtRot(for: boneName, worldTargetRot: worldTargetRot)
+            let localTargetRot = simd_normalize(effectiveParentTgt.inverse * worldTgt)
             boneRotations.append((boneName, localTargetRot))
         }
 

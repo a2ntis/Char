@@ -728,6 +728,7 @@ final class CompanionVRMRealityView: ARView {
     private var idleLastItemId: UUID? = nil   // avoid repeating the same clip
     private var wasInIdleState = false
     private var startupGreetingPlayed = false  // play startup greeting once on model load
+    private var idleCyclingActive = false      // true while a VRMA/BVH idle chain is running
 
     // MARK: - Pose hold timer (auto-clear event-triggered poses after N seconds)
     private var poseHoldTimer: Timer?
@@ -845,6 +846,7 @@ final class CompanionVRMRealityView: ARView {
             wasInIdleState = false
             idleWaitTime = 0
             idleConverting = false
+            idleCyclingActive = false
             updateSubscription?.cancel()
             updateSubscription = nil
 
@@ -909,10 +911,11 @@ final class CompanionVRMRealityView: ARView {
     private func updateIdleAnimation(deltaTime: TimeInterval) {
         let isIdle = presenceState == .idle
 
-        // Reset countdown whenever we (re-)enter idle state (mid-session transitions only)
+        // Reset when we (re-)enter idle state mid-session
         if isIdle && !wasInIdleState {
             idleWaitTime = 0
             idleNextTrigger = TimeInterval.random(in: 5...10)
+            idleCyclingActive = false
         }
         wasInIdleState = isIdle
 
@@ -928,6 +931,13 @@ final class CompanionVRMRealityView: ARView {
             return  // vrmaPlayer is now set; guard will block ticking until it finishes
         }
 
+        // If a cycling chain is active, chain the next animation immediately — no pause
+        if idleCyclingActive {
+            playNextIdleAnimation()
+            return
+        }
+
+        // First animation in a new session — wait for the initial trigger delay
         idleWaitTime += deltaTime
         guard idleWaitTime >= idleNextTrigger else { return }
 
@@ -981,9 +991,11 @@ final class CompanionVRMRealityView: ARView {
             guard presenceState == .idle, vrmaPlayer == nil, posePlayer == nil else { return }
             playVRMA(filePath: fullPath)
             vrmaPlayer?.skipLookBones = true
+            idleCyclingActive = true   // chain: when this ends, play next immediately
 
         case .bvh:
             idleConverting = true
+            idleCyclingActive = true   // will continue chaining after conversion
             Task.detached(priority: .utility) { [weak self, fullPath] in
                 do {
                     let vrmaPath = try BVHConverter.vrmaPath(for: fullPath)
@@ -997,12 +1009,16 @@ final class CompanionVRMRealityView: ARView {
                         self.vrmaPlayer?.skipLookBones = true
                     }
                 } catch {
-                    await MainActor.run { [weak self] in self?.idleConverting = false }
+                    await MainActor.run { [weak self] in
+                        self?.idleConverting = false
+                        self?.idleCyclingActive = false  // conversion failed — stop chain
+                    }
                 }
             }
 
         case .pose:
             guard presenceState == .idle, vrmaPlayer == nil else { return }
+            idleCyclingActive = false   // pose is held, not chained; poseHoldTimer clears it
             applyEventPose(filePath: fullPath)
         }
     }

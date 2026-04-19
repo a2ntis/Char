@@ -645,63 +645,6 @@ struct CompanionSettingsView: View {
                     }
                 }
 
-                if viewModel.selectedModel.runtime == .vrm && !viewModel.availablePoses.isEmpty {
-                    Text("Позы (.vroidpose)")
-                        .font(.footnote.weight(.semibold))
-                        .foregroundStyle(.secondary)
-
-                    LazyVGrid(columns: [
-                        GridItem(.flexible(minimum: 120), spacing: 8),
-                        GridItem(.flexible(minimum: 120), spacing: 8)
-                    ], spacing: 8) {
-                        ForEach(viewModel.availablePoses) { pose in
-                            Button(pose.displayName) {
-                                viewModel.previewPose(pose)
-                            }
-                            .buttonStyle(.borderedProminent)
-                            .tint(.purple.opacity(0.75))
-                        }
-                    }
-                }
-
-                if viewModel.selectedModel.runtime == .vrm && !viewModel.availableVRMAAnimations.isEmpty {
-                    Text("VRM анимации (.vrma)")
-                        .font(.footnote.weight(.semibold))
-                        .foregroundStyle(.secondary)
-
-                    LazyVGrid(columns: [
-                        GridItem(.flexible(minimum: 120), spacing: 8),
-                        GridItem(.flexible(minimum: 120), spacing: 8)
-                    ], spacing: 8) {
-                        ForEach(viewModel.availableVRMAAnimations) { animation in
-                            Button(animation.displayName) {
-                                viewModel.previewVRMA(animation)
-                            }
-                            .buttonStyle(.borderedProminent)
-                            .tint(.teal.opacity(0.85))
-                        }
-                    }
-                }
-
-                if viewModel.selectedModel.runtime == .vrm && !viewModel.availableBVHAnimations.isEmpty {
-                    Text("BVH анимации (.bvh)")
-                        .font(.footnote.weight(.semibold))
-                        .foregroundStyle(.secondary)
-
-                    LazyVGrid(columns: [
-                        GridItem(.flexible(minimum: 120), spacing: 8),
-                        GridItem(.flexible(minimum: 120), spacing: 8)
-                    ], spacing: 8) {
-                        ForEach(viewModel.availableBVHAnimations) { animation in
-                            Button(animation.displayName) {
-                                viewModel.previewBVH(animation)
-                            }
-                            .buttonStyle(.borderedProminent)
-                            .tint(.cyan.opacity(0.85))
-                        }
-                    }
-                }
-
                 if viewModel.selectedModel.runtime == .vrm {
                     Text("Базовые VRM выражения")
                         .font(.footnote.weight(.semibold))
@@ -728,7 +671,7 @@ struct CompanionSettingsView: View {
         }
         .formStyle(.grouped)
         .padding(20)
-        .frame(width: 560, height: 680)
+        .frame(minWidth: 520, minHeight: 480)
     }
 
     private func emotionButton(_ title: String, emotion: CompanionEmotionState?) -> some View {
@@ -746,6 +689,7 @@ private struct AnimationBrickView: View {
     let item: AnimationSlotItem
     var showRemove: Bool = false
     var onRemove: (() -> Void)? = nil
+    var onTap: (() -> Void)? = nil
 
     var body: some View {
         HStack(spacing: 4) {
@@ -773,6 +717,13 @@ private struct AnimationBrickView: View {
         .padding(.vertical, 4)
         .background(brickColor.opacity(0.07), in: RoundedRectangle(cornerRadius: 6))
         .overlay(RoundedRectangle(cornerRadius: 6).stroke(brickColor.opacity(0.28), lineWidth: 1))
+        .contentShape(RoundedRectangle(cornerRadius: 6))
+        .onTapGesture { onTap?() }
+        .onHover { hovering in
+            if onTap != nil {
+                if hovering { NSCursor.pointingHand.push() } else { NSCursor.pop() }
+            }
+        }
     }
 
     var brickColor: Color {
@@ -788,6 +739,7 @@ private struct AnimationEventRowView: View {
     let event: AnimationEventType
     let items: [AnimationSlotItem]
     let onUpdate: ([AnimationSlotItem]) -> Void
+    var onPreview: ((AnimationSlotItem) -> Void)? = nil
     @State private var isTargeted = false
 
     var body: some View {
@@ -803,11 +755,12 @@ private struct AnimationEventRowView: View {
             ScrollView(.horizontal, showsIndicators: false) {
                 HStack(spacing: 4) {
                     ForEach(items) { item in
-                        AnimationBrickView(item: item, showRemove: true) {
+                        AnimationBrickView(item: item, showRemove: true,
+                                           onRemove: {
                             var updated = items
                             updated.removeAll { $0.id == item.id }
                             onUpdate(updated)
-                        }
+                        }, onTap: { onPreview?(item) })
                     }
                     if items.isEmpty {
                         Text("перетащи сюда")
@@ -844,6 +797,35 @@ private struct AnimationEventRowView: View {
     }
 }
 
+private struct AnimationEventCategorySection: View {
+    let category: AnimationEventCategory
+    let mappings: [String: [AnimationSlotItem]]
+    let onUpdate: (String, [AnimationSlotItem]) -> Void
+    var onPreview: ((AnimationSlotItem) -> Void)? = nil
+
+    private var events: [AnimationEventType] {
+        AnimationEventType.allCases.filter { $0.category == category }
+    }
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 2) {
+            Text("\(category.icon) \(category.displayName)")
+                .font(.caption.weight(.semibold))
+                .foregroundStyle(.secondary)
+                .padding(.top, 8)
+                .padding(.bottom, 2)
+            ForEach(events) { event in
+                AnimationEventRowView(
+                    event: event,
+                    items: mappings[event.rawValue] ?? [],
+                    onUpdate: { newItems in onUpdate(event.rawValue, newItems) },
+                    onPreview: onPreview
+                )
+            }
+        }
+    }
+}
+
 private struct AnimationEventMappingsView: View {
     @ObservedObject var viewModel: CompanionViewModel
     @State private var paletteFilter: String = ""
@@ -854,56 +836,67 @@ private struct AnimationEventMappingsView: View {
         return all.filter { $0.displayName.localizedCaseInsensitiveContains(paletteFilter) }
     }
 
+    private func preview(_ item: AnimationSlotItem) {
+        let fullPath = AppEnvironment.assetsRootURL.appendingPathComponent(item.filePath).path
+        switch item.assetType {
+        case .vrma:
+            viewModel.previewVRMA(CompanionVRMAOption(
+                id: fullPath, displayName: item.displayName, filePath: fullPath))
+        case .bvh:
+            viewModel.previewBVH(CompanionBVHOption(
+                id: fullPath, displayName: item.displayName, filePath: fullPath))
+        case .pose:
+            viewModel.previewPose(CompanionPoseOption(
+                id: fullPath, displayName: item.displayName, filePath: fullPath))
+        }
+    }
+
     var body: some View {
-        HStack(alignment: .top, spacing: 10) {
-            // ── Palette ──
-            VStack(alignment: .leading, spacing: 6) {
-                Text("Доступные")
-                    .font(.caption.weight(.semibold))
-                    .foregroundStyle(.secondary)
-                TextField("Поиск…", text: $paletteFilter)
-                    .textFieldStyle(.roundedBorder)
-                    .font(.caption)
-                ScrollView {
-                    VStack(alignment: .leading, spacing: 4) {
-                        ForEach(filteredPalette) { item in
-                            AnimationBrickView(item: item)
-                                .draggable(item)
-                                .frame(maxWidth: .infinity, alignment: .leading)
+        GeometryReader { geo in
+            HStack(alignment: .top, spacing: 10) {
+                // ── Palette ──
+                VStack(alignment: .leading, spacing: 6) {
+                    Text("Доступные")
+                        .font(.caption.weight(.semibold))
+                        .foregroundStyle(.secondary)
+                    TextField("Поиск…", text: $paletteFilter)
+                        .textFieldStyle(.roundedBorder)
+                        .font(.caption)
+                    ScrollView {
+                        VStack(alignment: .leading, spacing: 4) {
+                            ForEach(filteredPalette) { item in
+                                AnimationBrickView(item: item, onTap: { preview(item) })
+                                    .draggable(item)
+                                    .frame(maxWidth: .infinity, alignment: .leading)
+                            }
                         }
+                        .padding(.bottom, 4)
                     }
-                    .padding(.bottom, 4)
                 }
-            }
-            .frame(width: 162)
+                .frame(width: 162)
 
-            Divider()
+                Divider()
 
-            // ── Event slots ──
-            ScrollView {
-                VStack(alignment: .leading, spacing: 2) {
-                    ForEach(AnimationEventCategory.allCases, id: \.self) { category in
-                        let events = AnimationEventType.allCases.filter { $0.category == category }
-                        Text("\(category.icon) \(category.displayName)")
-                            .font(.caption.weight(.semibold))
-                            .foregroundStyle(.secondary)
-                            .padding(.top, 8)
-                            .padding(.bottom, 2)
-                        ForEach(events) { event in
-                            AnimationEventRowView(
-                                event: event,
-                                items: viewModel.profile.animationEventMappings[event.rawValue] ?? [],
-                                onUpdate: { newItems in
-                                    viewModel.profile.animationEventMappings[event.rawValue] = newItems
-                                }
+                // ── Event slots ──
+                ScrollView {
+                    VStack(alignment: .leading, spacing: 2) {
+                        ForEach(AnimationEventCategory.allCases, id: \.self) { category in
+                            AnimationEventCategorySection(
+                                category: category,
+                                mappings: viewModel.profile.animationEventMappings,
+                                onUpdate: { key, items in
+                                    viewModel.profile.animationEventMappings[key] = items
+                                },
+                                onPreview: { item in preview(item) }
                             )
                         }
                     }
+                    .padding(.trailing, 4)
                 }
-                .padding(.trailing, 4)
             }
+            .frame(width: geo.size.width, height: geo.size.height)
         }
-        .frame(height: 380)
+        .frame(maxWidth: .infinity, minHeight: 400)
     }
 }
 

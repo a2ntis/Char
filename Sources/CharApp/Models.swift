@@ -1,6 +1,7 @@
 import Foundation
 import CoreGraphics
 import UniformTypeIdentifiers
+import CoreTransferable
 
 enum CompanionLLMProvider: String, CaseIterable, Codable, Hashable, Identifiable {
     case ollama
@@ -207,11 +208,11 @@ struct AnimationSlotItem: Codable, Identifiable, Hashable {
 
 extension AnimationSlotItem: Transferable {
     static var transferRepresentation: some TransferRepresentation {
-        DataRepresentation(contentType: .data) { item in
-            try JSONEncoder().encode(item)
-        } importing: { data in
-            try JSONDecoder().decode(AnimationSlotItem.self, from: data)
-        }
+        DataRepresentation(
+            contentType: .data,
+            exporting: { try JSONEncoder().encode($0) },
+            importing: { try JSONDecoder().decode(AnimationSlotItem.self, from: $0) }
+        )
     }
 }
 
@@ -222,7 +223,7 @@ enum AnimationPlayMode: String, Codable {
     case oneShot
 }
 
-enum AnimationEventCategory: String, Codable, CaseIterable {
+enum AnimationEventCategory: String, Codable, CaseIterable, Hashable {
     case state
     case emotion
     case interaction
