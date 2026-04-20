@@ -799,6 +799,7 @@ final class CompanionVRMRealityView: ARView {
     private var lookAtFromHeadRot: simd_quatf? = nil
     private var prevVrmaPlayerActive = false
     private var prevVrmaSkipLookBones = false
+    private var prevPosePlayerActive = false
 
     required init(frame frameRect: NSRect) {
         super.init(frame: frameRect)
@@ -1328,14 +1329,21 @@ final class CompanionVRMRealityView: ARView {
     private func updateBodyAnimation(deltaTime: TimeInterval) {
         guard let vrmEntity else { return }
 
-        // Detect when a non-look-at animation ends so we can blend look-at back in smoothly.
+        // Detect when a non-look-at animation or pose ends so we can blend look-at back in smoothly.
         let hadVrma = prevVrmaPlayerActive
         let hadSkipLook = prevVrmaSkipLookBones
+        let hadPose = prevPosePlayerActive
         prevVrmaPlayerActive = vrmaPlayer != nil
         prevVrmaSkipLookBones = vrmaPlayer?.skipLookBones ?? false
+        prevPosePlayerActive = posePlayer != nil
 
         if hadVrma && !hadSkipLook && vrmaPlayer == nil {
             // Animation just ended and it was controlling neck/head — capture its final pose.
+            lookAtFromNeckRot = neckEntity?.transform.rotation
+            lookAtFromHeadRot = headEntity?.transform.rotation
+            lookAtWeight = 0
+        } else if hadPose && posePlayer == nil && vrmaPlayer == nil {
+            // Pose just ended — capture head/neck position for smooth look-at blend-in.
             lookAtFromNeckRot = neckEntity?.transform.rotation
             lookAtFromHeadRot = headEntity?.transform.rotation
             lookAtWeight = 0
@@ -1352,8 +1360,11 @@ final class CompanionVRMRealityView: ARView {
 
             // For idle animations the neck/head are intentionally left to look-at
             // (VRMAPlayer.skipLookBones = true), so we fall through to apply it.
-            // For all other animations, reset bones fully and return.
-            let isIdleAnim = presenceState == .idle && vrmaPlayer?.skipLookBones == true
+            // For poses, look-at also keeps tracking neck/head so there is no freeze
+            // while the pose holds — the pose player only overrides bones in the pose file,
+            // and head/neck are usually absent from body-only poses (arms-crossed, etc.).
+            let skipLook = vrmaPlayer?.skipLookBones ?? false
+            let isIdleAnim = (presenceState == .idle && skipLook) || (posePlayer != nil)
             if !isIdleAnim {
                 spineEntity?.transform.rotation = spineBaseRotation
                 chestEntity?.transform.rotation = chestBaseRotation
